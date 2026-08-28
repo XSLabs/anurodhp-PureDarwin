@@ -135,23 +135,16 @@ xpc_domain_add_services(job_t j, vm_offset_t services_buff, mach_msg_type_number
 #define XPC_LPI_VERSION 20141120
 
 
-__inline int
-posix_spawnattr_setprocesstype_np(posix_spawnattr_t * a __unused, const int b __unused)
-{
-	return 0;
-}
-
-__inline int
-posix_spawnattr_set_importancewatch_port_np(posix_spawnattr_t * __restrict attr __unused,
-											int count __unused, mach_port_t portarray[] __unused)
-{
-	return 0;
-}
-
-__inline int
-posix_spawnattr_setcpumonitor_default(posix_spawnattr_t * __restrict a __unused)
-{
-	return 0;
-}
+/* posix_spawnattr_setprocesstype_np()/posix_spawnattr_set_
+ * importancewatch_port_np()/posix_spawnattr_setcpumonitor_default() no-
+ * op placeholders removed 2026-08-28 (iokit project): real
+ * third_party/xnu-7195/libsyscall/wrappers/spawn/posix_spawn.c already
+ * provides real, functional definitions of all three (confirmed by
+ * reading that file directly) -- a real trial link found this file's
+ * own plain `__inline` (non-static, so a real external definition even
+ * when not actually inlined) copies hard-conflicting with them as
+ * duplicate symbols. Real, working implementations win over no-op
+ * placeholders.
+ */
 
 #endif
