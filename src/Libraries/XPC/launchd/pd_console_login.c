@@ -87,7 +87,9 @@ main(void)
 	setenv("HOME", "/var/root", 1);
 	setenv("USER", "root", 1);
 	setenv("LOGNAME", "root", 1);
-	setenv("SHELL", "/bin/zsh", 1);
+	/* iokit project: no /bin/zsh on this image -- real bash 3.2 is this
+	 * project's actual shell, installed at both /bin/bash and /bin/sh. */
+	setenv("SHELL", "/bin/bash", 1);
 	setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
 	setenv("TERM", "vt220", 0);
 	{
@@ -103,8 +105,8 @@ main(void)
 		}
 	}
 
-	char *argv[] = { "/bin/zsh", "-l", NULL };
-	ctrace("pd-console-login: exec /bin/zsh\n");
+	char *argv[] = { "/bin/bash", "-l", NULL };
+	ctrace("pd-console-login: exec /bin/bash\n");
 	execv(argv[0], argv);
 	ctrace("pd-console-login: execv failed\n");
 	_exit(127);

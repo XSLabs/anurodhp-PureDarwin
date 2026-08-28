@@ -290,6 +290,16 @@ main(int argc, char *const *argv)
 		/* PureDarwin: mount /dev before launchctl bootstraps the system domain. */
 		extern void pd_launchd_boot(void);
 		pd_launchd_boot();
+
+		/* iokit project: pd_launchd_load_daemons_dir() is real PureDarwin
+		 * source (pd_launchd_plist.c) but was never actually called from
+		 * anywhere upstream -- this project has no launchctl client to load
+		 * jobs after the fact, so without this call launchd boots with an
+		 * empty job table and nothing (console login, syslogd, ...) ever
+		 * starts. Load system daemons directly at boot, matching real
+		 * launchd's own pre-launchctl-load-message-era behavior. */
+		extern void pd_launchd_load_daemons_dir(const char *dir);
+		pd_launchd_load_daemons_dir("/Library/LaunchDaemons");
 	}
 	launchd_runtime_init2();
 	launchd_runtime();
