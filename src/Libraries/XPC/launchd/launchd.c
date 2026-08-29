@@ -127,11 +127,61 @@ FILE *launchd_console = NULL;
 int32_t launchd_sync_frequency = 30;
 
 
+/* Real, locally-defined (this project's own static build, see
+ * tools/userland_staging/pthread_main_thread_bootstrap.c) -- no header
+ * exposes this prototype to launchd's own real PureDarwin source, so
+ * declared here directly. Used below in main(), bug #6 investigation. */
+extern int pthread_main_thread_bootstrap(void);
+
+/* TEMP DIAGNOSTIC: bisecting a silent exit(1) with zero console output
+ * anywhere before it -- first round (this project's normal open()/
+ * write()/strlen()) produced NO output at all, not even "main() entry"
+ * at the very top of main(), which means either main() itself is never
+ * reached (something before it, e.g. a real dyld/libc++/ICU static
+ * initializer, calls exit(1) first) or this project's own open()/write()
+ * wrappers have a bug. This second round uses RAW syscalls (matching
+ * crt0_smoketest.c's own proven-working pattern), bypassing libc's
+ * open()/write() entirely, to isolate which. Remove once root-caused. */
+static long
+iokit_diag_syscall3(long num, long a0, long a1, long a2)
+{
+	register long x0 asm("x0") = a0;
+	register long x1 asm("x1") = a1;
+	register long x2 asm("x2") = a2;
+	register long x16 asm("x16") = num;
+	asm volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "cc");
+	return x0;
+}
+
+static void
+iokit_diag(const char *msg)
+{
+	long len = 0;
+	while (msg[len] != '\0') {
+		len++;
+	}
+	long fd = iokit_diag_syscall3(5 /* SYS_open */, (long)_PATH_CONSOLE, O_WRONLY | O_NOCTTY, 0);
+	if (fd < 0) {
+		return;
+	}
+	iokit_diag_syscall3(4 /* SYS_write */, fd, (long)msg, len);
+	iokit_diag_syscall3(6 /* SYS_close */, fd, 0, 0);
+}
+
+__attribute__((constructor))
+static void
+iokit_diag_ctor(void)
+{
+	iokit_diag("DIAG: __mod_init_func constructor reached (before main())\n");
+}
+
 int
 main(int argc, char *const *argv)
 {
 	bool sflag = false;
 	int ch;
+
+	iokit_diag("DIAG: main() entry\n");
 
 	/* This needs to be cleaned up. Currently, we risk tripping assumes() macros
 	 * before we've properly set things like launchd's log database paths, the
@@ -143,6 +193,7 @@ main(int argc, char *const *argv)
 	testfd_or_openfd(STDIN_FILENO, _PATH_DEVNULL, O_RDONLY);
 	testfd_or_openfd(STDOUT_FILENO, _PATH_DEVNULL, O_WRONLY);
 	testfd_or_openfd(STDERR_FILENO, _PATH_DEVNULL, O_WRONLY);
+	iokit_diag("DIAG: past testfd_or_openfd\n");
 
 	if (launchd_use_gmalloc) {
 		if (!getenv("DYLD_INSERT_LIBRARIES")) {
@@ -173,18 +224,47 @@ main(int argc, char *const *argv)
 	}
 
 	if (getpid() != 1 && getppid() != 1) {
+		iokit_diag("DIAG: failing getpid/getppid check, exiting\n");
 		fprintf(stderr, "%s: This program is not meant to be run directly.\n", getprogname());
 		exit(EXIT_FAILURE);
 	}
+	iokit_diag("DIAG: passed getpid/getppid check\n");
+
+	/* REAL BUG under investigation (bug #6, session 2): launchd.macho's
+	 * own statically-linked pthread machinery (runtime.c's real
+	 * pthread_create() call inside launchd_runtime_init(), below) has
+	 * its OWN separate, local copy of _main_thread/__pthread_head/
+	 * pthread_main_thread_bootstrap (confirmed via `nm launchd.macho` --
+	 * all real, locally-defined `T`/`S`/`d` symbols, not `U`) -- a
+	 * SEPARATE image's worth of pthread state from libsystem_pthread.dylib's
+	 * own copy, which libsystem_dyld_initializer_compat.c's constructor
+	 * already bootstraps via a cross-dylib call. TPIDRRO_EL0 is a single,
+	 * real, process-global CPU register though -- so after that
+	 * constructor runs, it points at libsystem_pthread.dylib's own
+	 * &_main_thread.tsd[0], not launchd's own local copy's. Any code in
+	 * launchd's own local pthread copy that computes pthread_self()/
+	 * errno from that same register would get a valid-looking pointer
+	 * into the WRONG image's struct -- a real cross-image confusion,
+	 * exactly the shape of the new second-thread SIGSEGV this fix is
+	 * testing. This is genuinely the FIRST call against THIS copy's
+	 * _main_thread/__pthread_head (confirmed via nm -- nothing has
+	 * touched them yet), not a double-bootstrap of anything already
+	 * initialized once. */
+	pthread_main_thread_bootstrap();
+	iokit_diag("DIAG: past launchd-local pthread_main_thread_bootstrap\n");
 
 	launchd_runtime_init();
+	iokit_diag("DIAG: returned from launchd_runtime_init\n");
 
 	if (NULL == getenv("PATH")) {
 		setenv("PATH", _PATH_STDPATH, 1);
 	}
+	iokit_diag("DIAG: past PATH setenv\n");
 
 	if (pid1_magic) {
+		iokit_diag("DIAG: about to call pid1_magic_init\n");
 		pid1_magic_init();
+		iokit_diag("DIAG: returned from pid1_magic_init\n");
 
 		int cfd = -1;
 		if ((cfd = open(_PATH_CONSOLE, O_WRONLY | O_NOCTTY)) != -1) {
