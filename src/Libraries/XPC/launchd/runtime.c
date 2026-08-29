@@ -662,6 +662,17 @@ x_handle_kqueue(mach_port_t junk __attribute__((unused)), integer_t fd)
 void
 launchd_runtime(void)
 {
+	/* TEMP DIAGNOSTIC 2026-08-29, launchd bug #6: real kernel-side
+	 * kprintf bisection (osfmk/ipc/mach_msg.c/ipc_mqueue.c, see
+	 * iokit/docs/backlog.md item d11) narrowed the crash to the second
+	 * (kqueue_demand_loop) thread's blocking mach_msg() receive, but
+	 * left open whether the MAIN thread ever reaches its own receive
+	 * loop (launchd_runtime2 below, real xpc_pipe_try_receive on
+	 * ipc_port_set/launchd_internal_port) before the crash -- no log so
+	 * far shows a second mach_msg_overwrite_trap call tagged with the
+	 * main thread. This print settles that cheaply (launchd.macho-only
+	 * rebuild, no kernel rebuild needed). */
+	iokit_diag8("IOKITDIAG8: launchd_runtime about to call launchd_runtime2\n");
 	launchd_runtime2(max_msg_size);
 	dispatch_main();
 }
@@ -1143,12 +1154,15 @@ pd_runtime_phase(const char *fmt, ...)
 void
 launchd_runtime2(mach_msg_size_t msg_size)
 {
+	iokit_diag8("IOKITDIAG8: launchd_runtime2 entry\n");
 	for (;;) {
 		launchd_log_push();
 
 		mach_port_t recvp = MACH_PORT_NULL;
 		xpc_object_t request = NULL;
+		iokit_diag8("IOKITDIAG8: launchd_runtime2 about to call xpc_pipe_try_receive\n");
 		int result = xpc_pipe_try_receive(ipc_port_set, &request, &recvp, launchd_mig_demux, msg_size, 0);
+		iokit_diag8("IOKITDIAG8: launchd_runtime2 past xpc_pipe_try_receive\n");
 		if (result == 0 && request) {
 			boolean_t handled = false;
 			time_of_mach_msg_return = runtime_get_opaque_time();

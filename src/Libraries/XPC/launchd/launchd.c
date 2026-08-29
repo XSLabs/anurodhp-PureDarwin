@@ -306,15 +306,20 @@ main(int argc, char *const *argv)
 			launchd_syslog(LOG_NOTICE | LOG_CONSOLE, "*** Debug logging is enabled. ***");
 		}
 
+		iokit_diag("DIAG: about to call handle_pid1_crashes_separately\n");
 		handle_pid1_crashes_separately();
+		iokit_diag("DIAG: past handle_pid1_crashes_separately\n");
 
 		/* Start the update thread.
 		 *
 		 * <rdar://problem/5039559&6153301>
 		 */
 		pthread_t t = NULL;
+		iokit_diag("DIAG: about to call pthread_create for update_thread (THIRD real thread)\n");
 		(void)os_assumes_zero(pthread_create(&t, NULL, update_thread, NULL));
+		iokit_diag("DIAG: past pthread_create for update_thread\n");
 		(void)os_assumes_zero(pthread_detach(t));
+		iokit_diag("DIAG: past pthread_detach for update_thread\n");
 
 		/* PID 1 doesn't have a flat namespace. */
 		launchd_flat_mach_namespace = false;
