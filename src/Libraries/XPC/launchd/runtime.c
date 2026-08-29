@@ -191,69 +191,18 @@ union do_notify_max_sz {
 	union __ReplyUnion__do_notify_subsystem rep;
 };
 
-/* TEMP DIAGNOSTIC: bisecting a real SIGABRT (namespace 2/OS_REASON_SIGNAL
- * subcode 0x6) somewhere inside this function -- see docs/backlog.md item
- * d10 for the full trail (this is the NEW bug that surfaced once the
- * pthread-main-thread-bootstrap fix let real main() run for the first
- * time). Raw syscalls, not stdio, same pattern used throughout this
- * project's own recent dyld/libc++/libpthread bisection. Remove once
- * root-caused. */
-static long iokit_diag8_syscall3(long num, long a0, long a1, long a2) {
-	register long x0 asm("x0") = a0;
-	register long x1 asm("x1") = a1;
-	register long x2 asm("x2") = a2;
-	register long x16 asm("x16") = num;
-	asm volatile("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x16) : "memory", "cc");
-	return x0;
-}
-static void iokit_diag8(const char *msg) {
-	long len = 0;
-	while (msg[len] != '\0') { len++; }
-	long fd = iokit_diag8_syscall3(5, (long)"/dev/console", 0x0001 | 0x20000, 0);
-	if (fd < 0) { return; }
-	iokit_diag8_syscall3(4, fd, (long)msg, len);
-	iokit_diag8_syscall3(6, fd, 0, 0);
-}
-
 void
 launchd_runtime_init(void)
 {
 	pid_t p = getpid();
-	iokit_diag8("IOKITDIAG8: launchd_runtime_init entry\n");
 	(void)posix_assert_zero((mainkq = kqueue()));
-	iokit_diag8("IOKITDIAG8: past kqueue()\n");
 
-	{
-		mach_port_t self_task = mach_task_self();
-		char tmsg[80] = "IOKITDIAG8: mach_task_self()=0x00000000\n";
-		for (int i = 0; i < 8; i++) {
-			int nib = (self_task >> ((7 - i) * 4)) & 0xf;
-			tmsg[31 + i] = (char)(nib < 10 ? '0' + nib : 'a' + nib - 10);
-		}
-		iokit_diag8(tmsg);
-
-		kern_return_t kr_demand = mach_port_allocate(self_task, MACH_PORT_RIGHT_PORT_SET, &demand_port_set);
-		char kmsg[80] = "IOKITDIAG8: mach_port_allocate kr=-0000000000\n";
-		int neg = kr_demand < 0;
-		unsigned int mag = (unsigned int)(neg ? -kr_demand : kr_demand);
-		kmsg[34] = neg ? '-' : ' ';
-		for (int i = 9; i >= 0; i--) {
-			kmsg[35 + i] = (char)('0' + (mag % 10));
-			mag /= 10;
-		}
-		iokit_diag8(kmsg);
-		os_assert_zero(kr_demand);
-	}
-	iokit_diag8("IOKITDIAG8: past demand_port_set mach_port_allocate\n");
+	os_assert_zero(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &demand_port_set));
 	os_assert_zero(mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &ipc_port_set));
-	iokit_diag8("IOKITDIAG8: past ipc_port_set mach_port_allocate\n");
 	posix_assert_zero(kevent_mod(demand_port_set, EVFILT_MACHPORT, EV_ADD, 0, 0, &kqmportset_callback));
-	iokit_diag8("IOKITDIAG8: past kevent_mod\n");
 
 	os_assert_zero(launchd_mport_create_recv(&launchd_internal_port));
-	iokit_diag8("IOKITDIAG8: past launchd_mport_create_recv\n");
 	os_assert_zero(launchd_mport_make_send(launchd_internal_port));
-	iokit_diag8("IOKITDIAG8: past launchd_mport_make_send\n");
 
     // _sjc_ investigate this here
 	max_msg_size = sizeof(union vproc_mig_max_sz);
@@ -262,14 +211,10 @@ launchd_runtime_init(void)
 	}
 
 	os_assert_zero(runtime_add_mport(launchd_internal_port, launchd_internal_demux));
-	iokit_diag8("IOKITDIAG8: past runtime_add_mport\n");
 	os_assert_zero(pthread_create(&kqueue_demand_thread, NULL, kqueue_demand_loop, NULL));
-	iokit_diag8("IOKITDIAG8: past pthread_create\n");
 	os_assert_zero(pthread_detach(kqueue_demand_thread));
-	iokit_diag8("IOKITDIAG8: past pthread_detach\n");
 
 	(void)posix_assumes_zero(sysctlbyname("vfs.generic.noremotehang", NULL, NULL, &p, sizeof(p)));
-	iokit_diag8("IOKITDIAG8: launchd_runtime_init exit\n");
 }
 
 void
@@ -594,13 +539,10 @@ kqueue_demand_loop(void *arg __attribute__((unused)))
 	 * that manipulates the kqueue.
 	 */
 
-	iokit_diag8("IOKITDIAG8: kqueue_demand_loop (new thread) entry\n");
 	for (;;) {
 		FD_ZERO(&rfds);
 		FD_SET(mainkq, &rfds);
-		iokit_diag8("IOKITDIAG8: kqueue_demand_loop about to call select()\n");
 		int r = select(mainkq + 1, &rfds, NULL, NULL, NULL);
-		iokit_diag8("IOKITDIAG8: kqueue_demand_loop select() returned\n");
 		if (r == 1) {
 			(void)os_assumes_zero(handle_kqueue(launchd_internal_port, mainkq));
 		} else if (posix_assumes_zero(r) != -1) {
@@ -662,17 +604,6 @@ x_handle_kqueue(mach_port_t junk __attribute__((unused)), integer_t fd)
 void
 launchd_runtime(void)
 {
-	/* TEMP DIAGNOSTIC 2026-08-29, launchd bug #6: real kernel-side
-	 * kprintf bisection (osfmk/ipc/mach_msg.c/ipc_mqueue.c, see
-	 * iokit/docs/backlog.md item d11) narrowed the crash to the second
-	 * (kqueue_demand_loop) thread's blocking mach_msg() receive, but
-	 * left open whether the MAIN thread ever reaches its own receive
-	 * loop (launchd_runtime2 below, real xpc_pipe_try_receive on
-	 * ipc_port_set/launchd_internal_port) before the crash -- no log so
-	 * far shows a second mach_msg_overwrite_trap call tagged with the
-	 * main thread. This print settles that cheaply (launchd.macho-only
-	 * rebuild, no kernel rebuild needed). */
-	iokit_diag8("IOKITDIAG8: launchd_runtime about to call launchd_runtime2\n");
 	launchd_runtime2(max_msg_size);
 	dispatch_main();
 }
@@ -782,11 +713,9 @@ runtime_add_mport(mach_port_t name, mig_callback demux)
 	mach_port_t target_set = demux ? ipc_port_set : demand_port_set;
 	kern_return_t kr;
 
-	iokit_diag8("IOKITDIAG8: runtime_add_mport entry\n");
 	if (unlikely(needed_table_sz > mig_cb_table_sz)) {
 		needed_table_sz *= 2; /* Let's try and avoid realloc'ing for a while */
 		mig_callback *new_table = malloc(needed_table_sz);
-		iokit_diag8("IOKITDIAG8: runtime_add_mport past malloc\n");
 
 		if (!new_table) {
 			return KERN_RESOURCE_SHORTAGE;
@@ -802,13 +731,10 @@ runtime_add_mport(mach_port_t name, mig_callback demux)
 	}
 
 	mig_cb_table[MACH_PORT_INDEX(name)] = demux;
-	iokit_diag8("IOKITDIAG8: runtime_add_mport about to call mach_port_move_member\n");
 
 	kr = mach_port_move_member(mach_task_self(), name, target_set);
-	iokit_diag8("IOKITDIAG8: runtime_add_mport past mach_port_move_member\n");
 	pd_runtime_phase("runtime_add_mport port=0x%x idx=%u demux=%p set=0x%x kr=0x%x",
 			name, MACH_PORT_INDEX(name), demux, target_set, kr);
-	iokit_diag8("IOKITDIAG8: runtime_add_mport exit\n");
 	return errno = kr;
 }
 
@@ -1154,15 +1080,12 @@ pd_runtime_phase(const char *fmt, ...)
 void
 launchd_runtime2(mach_msg_size_t msg_size)
 {
-	iokit_diag8("IOKITDIAG8: launchd_runtime2 entry\n");
 	for (;;) {
 		launchd_log_push();
 
 		mach_port_t recvp = MACH_PORT_NULL;
 		xpc_object_t request = NULL;
-		iokit_diag8("IOKITDIAG8: launchd_runtime2 about to call xpc_pipe_try_receive\n");
 		int result = xpc_pipe_try_receive(ipc_port_set, &request, &recvp, launchd_mig_demux, msg_size, 0);
-		iokit_diag8("IOKITDIAG8: launchd_runtime2 past xpc_pipe_try_receive\n");
 		if (result == 0 && request) {
 			boolean_t handled = false;
 			time_of_mach_msg_return = runtime_get_opaque_time();
