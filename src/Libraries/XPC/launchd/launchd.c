@@ -299,15 +299,35 @@ main(int argc, char *const *argv)
 
 	monitor_networking_state();
 	if (pid1_magic) {
+		/* PureDarwin: mount /dev before launchctl bootstraps the system
+		 * domain.
+		 *
+		 * iokit project, MOVED EARLIER 2026-08-30: this used to sit after
+		 * jobmgr_init() below, which was too late. pd_launchd_boot()'s
+		 * FIRST act is pd_launchd_boot_remount_root_rw() -- the real
+		 * `mount -uw /` equivalent this port needs because vfs_mountroot()
+		 * hardcodes MNT_RDONLY|MNT_ROOTFS (see pd_launchd_boot.c's own
+		 * comment) -- and pd_pid1_prepare_legacy_ipc() immediately below
+		 * writes to that same still-read-only root, producing the real
+		 * boot-log error
+		 *     mkdir("/var/tmp/"): Read-only file system
+		 * seen in every launchd PID-1 boot up to qemu/launchd_boot_test95.log.
+		 * The remount itself always succeeded, just after the directories
+		 * it was needed for. On real Darwin the root filesystem is already
+		 * read-write by the time launchd's own /var/tmp setup runs, so
+		 * remounting before it -- rather than reordering Apple's own
+		 * setup code -- is the faithful fix. Nothing between here and the
+		 * old call site writes to disk or depends on /dev being mounted
+		 * (console logging above goes through launchd_console, already
+		 * open), so moving it up is safe as well as correct. */
+		extern void pd_launchd_boot(void);
+		pd_launchd_boot();
+
 		pd_pid1_prepare_legacy_ipc();
 		ipc_server_init();
 	}
 	jobmgr_init(sflag);
 	if (pid1_magic) {
-		/* PureDarwin: mount /dev before launchctl bootstraps the system domain. */
-		extern void pd_launchd_boot(void);
-		pd_launchd_boot();
-
 		/* iokit project: pd_launchd_load_daemons_dir() is real PureDarwin
 		 * source (pd_launchd_plist.c) but was never actually called from
 		 * anywhere upstream -- this project has no launchctl client to load
