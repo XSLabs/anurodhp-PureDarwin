@@ -127,11 +127,7 @@ FILE *launchd_console = NULL;
 int32_t launchd_sync_frequency = 30;
 
 
-/* Real, locally-defined (this project's own static build, see
- * tools/userland_staging/pthread_main_thread_bootstrap.c) -- no header
- * exposes this prototype to launchd's own real PureDarwin source, so
- * declared here directly. Used below in main(), bug #6 investigation. */
-extern int pthread_main_thread_bootstrap(void);
+
 
 int
 main(int argc, char *const *argv)
@@ -184,27 +180,19 @@ main(int argc, char *const *argv)
 		exit(EXIT_FAILURE);
 	}
 
-	/* REAL BUG under investigation (bug #6, session 2): launchd.macho's
-	 * own statically-linked pthread machinery (runtime.c's real
-	 * pthread_create() call inside launchd_runtime_init(), below) has
-	 * its OWN separate, local copy of _main_thread/__pthread_head/
-	 * pthread_main_thread_bootstrap (confirmed via `nm launchd.macho` --
-	 * all real, locally-defined `T`/`S`/`d` symbols, not `U`) -- a
-	 * SEPARATE image's worth of pthread state from libsystem_pthread.dylib's
-	 * own copy, which libsystem_dyld_initializer_compat.c's constructor
-	 * already bootstraps via a cross-dylib call. TPIDRRO_EL0 is a single,
-	 * real, process-global CPU register though -- so after that
-	 * constructor runs, it points at libsystem_pthread.dylib's own
-	 * &_main_thread.tsd[0], not launchd's own local copy's. Any code in
-	 * launchd's own local pthread copy that computes pthread_self()/
-	 * errno from that same register would get a valid-looking pointer
-	 * into the WRONG image's struct -- a real cross-image confusion,
-	 * exactly the shape of the new second-thread SIGSEGV this fix is
-	 * testing. This is genuinely the FIRST call against THIS copy's
-	 * _main_thread/__pthread_head (confirmed via nm -- nothing has
-	 * touched them yet), not a double-bootstrap of anything already
-	 * initialized once. */
-	pthread_main_thread_bootstrap();
+	/* NOTE (2026-08-30, docs/daemon-roadmap.md Phase 6.8 continued):
+	 * launchd deliberately does NOT bootstrap the pthread main thread
+	 * here. libSystem.B.dylib's own constructor
+	 * (libsystem_dyld_initializer_compat.c) already does it, via
+	 * libsystem_pthread.dylib, before ANY initializer or main() runs --
+	 * so the correct number of additional bootstraps in launchd is zero.
+	 * An earlier explicit call here re-signed the shared _main_thread
+	 * with a SECOND, private munge token, after which every
+	 * pthread_self() served by libsystem_pthread.dylib (the copy real
+	 * CoreFoundation/libdispatch/libc++ bind to) failed
+	 * _pthread_validate_signature() and aborted into a silent exit(1).
+	 * launchd.macho no longer links a static pthread copy at all -- see
+	 * tools/userland_staging/build_launchd.sh. */
 
 	launchd_runtime_init();
 
