@@ -382,7 +382,7 @@ ipc_readmsg2(launch_data_t data, const char *cmd, void *context)
 #endif
 
 	if (rmc->c->j && strcmp(cmd, LAUNCH_KEY_CHECKIN) == 0) {
-		resp = job_export(rmc->c->j);
+		resp = job_export(rmc->c->j, true);
 		job_checkin(rmc->c->j);
 	} else if (allow_privileged_ops) {
 #if TARGET_OS_EMBEDDED
@@ -445,7 +445,7 @@ ipc_readmsg2(launch_data_t data, const char *cmd, void *context)
 				if ((j = job_find(NULL, launch_data_get_string(data))) == NULL) {
 					resp = launch_data_new_errno(errno);
 				} else {
-					resp = job_export(j);
+					resp = job_export(j, false);
 					ipc_revoke_fds(resp);
 				}
 			}

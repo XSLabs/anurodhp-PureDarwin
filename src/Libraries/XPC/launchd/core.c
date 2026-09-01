@@ -1061,7 +1061,7 @@ job_stop(job_t j)
 }
 
 launch_data_t
-job_export(job_t j)
+job_export(job_t j, bool for_checkin)
 {
 	launch_data_t tmp, tmp2, tmp3, r = launch_data_alloc(LAUNCH_DATA_DICTIONARY);
 
@@ -1139,7 +1139,20 @@ job_export(job_t j)
 		SLIST_FOREACH(sg, &j->sockets, sle) {
 			if ((tmp2 = launch_data_alloc(LAUNCH_DATA_ARRAY))) {
 				for (i = 0; i < sg->fd_cnt; i++) {
-					if ((tmp3 = launch_data_new_fd(sg->fds[i]))) {
+					/* launch_data_new_fd()/launch_data_alloc(LAUNCH_DATA_FD) back the
+					 * object with a plain int64 placeholder (see liblaunch.c's own
+					 * comment on that -- needed so `launchctl list`/GETJOB don't abort
+					 * on a job with Sockets). That's correct for display-only paths but
+					 * can't hand a working fd to a real checking-in job: the client's
+					 * launch_data_get_fd() calls xpc_fd_dup(), which requires a real
+					 * XPC_TYPE_FD object. Only the real checkin path may carry a real,
+					 * fileport-backed fd object across the message. */
+					if (for_checkin) {
+						tmp3 = (launch_data_t)xpc_fd_create(sg->fds[i]);
+					} else {
+						tmp3 = launch_data_new_fd(sg->fds[i]);
+					}
+					if (tmp3) {
 						launch_data_array_set_index(tmp2, tmp3, i);
 					}
 				}
@@ -1603,12 +1616,87 @@ job_remove(job_t j)
 	free(j);
 }
 
+/* Real AF_UNIX socket materialization from one Sockets-dict endpoint
+ * (SockPathName/SockType/SockPathMode). SockServiceName/SockNodeName
+ * (real network sockets, resolved via getaddrinfo) are a documented,
+ * real gap -- not needed by any job currently wired in, and not
+ * silently faked: logged and skipped rather than crashing. */
+static int
+socketgroup_setup_one(job_t j, launch_data_t obj, const char *name)
+{
+	launch_data_t tmp;
+	const char *path;
+	const char *type_str = "stream";
+	int sock_type;
+	int fd;
+	struct sockaddr_un sun;
+	mode_t oldmask;
+
+	if (launch_data_get_type(obj) != LAUNCH_DATA_DICTIONARY) {
+		job_log(j, LOG_ERR, "Sockets: %s: descriptor is not a dictionary, skipping", name);
+		return -1;
+	}
+
+	if ((tmp = launch_data_dict_lookup(obj, LAUNCH_JOBSOCKETKEY_PATHNAME)) == NULL ||
+			launch_data_get_type(tmp) != LAUNCH_DATA_STRING) {
+		job_log(j, LOG_ERR, "Sockets: %s: only SockPathName (AF_UNIX) sockets are implemented on "
+				"this target -- SockServiceName/SockNodeName network sockets are a real, "
+				"undone gap, not a silent stub", name);
+		return -1;
+	}
+	path = launch_data_get_string(tmp);
+
+	if ((tmp = launch_data_dict_lookup(obj, LAUNCH_JOBSOCKETKEY_TYPE)) &&
+			launch_data_get_type(tmp) == LAUNCH_DATA_STRING) {
+		type_str = launch_data_get_string(tmp);
+	}
+	sock_type = (strcasecmp(type_str, "dgram") == 0) ? SOCK_DGRAM : SOCK_STREAM;
+
+	memset(&sun, 0, sizeof(sun));
+	sun.sun_family = AF_UNIX;
+	strncpy(sun.sun_path, path, sizeof(sun.sun_path) - 1);
+
+	if ((fd = _fd(socket(AF_UNIX, sock_type, 0))) == -1) {
+		job_log(j, LOG_ERR, "Sockets: %s: socket(%s): %s", name, path, strerror(errno));
+		return -1;
+	}
+
+	if (unlink(path) == -1 && errno != ENOENT) {
+		job_log(j, LOG_ERR, "Sockets: %s: unlink(\"%s\"): %s", name, path, strerror(errno));
+	}
+
+	oldmask = umask(0);
+	if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) == -1) {
+		umask(oldmask);
+		job_log(j, LOG_ERR, "Sockets: %s: bind(\"%s\"): %s", name, path, strerror(errno));
+		runtime_close(fd);
+		return -1;
+	}
+	umask(oldmask);
+
+	if ((tmp = launch_data_dict_lookup(obj, LAUNCH_JOBSOCKETKEY_PATHMODE)) &&
+			launch_data_get_type(tmp) == LAUNCH_DATA_INTEGER) {
+		mode_t path_mode = (mode_t)launch_data_get_integer(tmp);
+		if (chmod(path, path_mode) == -1) {
+			job_log(j, LOG_ERR, "Sockets: %s: chmod(\"%s\", 0%o): %s", name, path, path_mode, strerror(errno));
+		}
+	}
+
+	if (sock_type == SOCK_STREAM && listen(fd, SOMAXCONN) == -1) {
+		job_log(j, LOG_ERR, "Sockets: %s: listen(\"%s\"): %s", name, path, strerror(errno));
+		runtime_close(fd);
+		return -1;
+	}
+
+	return fd;
+}
+
 void
 socketgroup_setup(launch_data_t obj, const char *key, void *context)
 {
 	launch_data_t tmp_oai;
 	job_t j = context;
-	size_t i, fd_cnt = 1;
+	size_t i, fd_cnt = 1, n = 0;
 	int *fds;
 
 	if (launch_data_get_type(obj) == LAUNCH_DATA_ARRAY) {
@@ -1624,12 +1712,18 @@ socketgroup_setup(launch_data_t obj, const char *key, void *context)
 			tmp_oai = obj;
 		}
 
-		fds[i] = launch_data_get_fd(tmp_oai);
+		int fd = socketgroup_setup_one(j, tmp_oai, key);
+		if (fd != -1) {
+			fds[n++] = fd;
+		}
 	}
 
-	socketgroup_new(j, key, fds, fd_cnt);
+	if (n == 0) {
+		job_log(j, LOG_ERR, "Sockets: %s: no real sockets created, group not registered", key);
+		return;
+	}
 
-	ipc_revoke_fds(obj);
+	socketgroup_new(j, key, fds, n);
 }
 
 bool
@@ -3498,7 +3592,7 @@ job_export_all2(jobmgr_t jm, launch_data_t where)
 	LIST_FOREACH(ji, &jm->jobs, sle) {
 		launch_data_t tmp;
 
-		if (jobmgr_assumes(jm, (tmp = job_export(ji)) != NULL)) {
+		if (jobmgr_assumes(jm, (tmp = job_export(ji, false)) != NULL)) {
 			launch_data_dict_insert(where, tmp, ji->label);
 		}
 	}
@@ -11787,7 +11881,7 @@ job_do_legacy_ipc_request(job_t j, launch_data_t request, mach_port_t asport __a
 	errno = ENOTSUP;
 	if (launch_data_get_type(request) == LAUNCH_DATA_STRING) {
 		if (strcmp(launch_data_get_string(request), LAUNCH_KEY_CHECKIN) == 0) {
-			reply = job_export(j);
+			reply = job_export(j, true);
 			job_checkin(j);
 		}
 	}

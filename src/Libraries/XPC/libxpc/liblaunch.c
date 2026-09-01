@@ -631,6 +631,20 @@ extern mach_port_t xpc_object_get_machport(xpc_object_t obj);
 mach_port_t
 launch_data_get_machport(launch_data_t d)
 {
+	/* See launch_data_alloc(): MACHPORT launch_data is backed by a plain
+	 * int64 holding the raw port name, not a real XPC_TYPE_CONNECTION/
+	 * XPC_TYPE_ENDPOINT object -- xpc_object_get_machport() would assert
+	 * on that. This is fine for the real checkin case: the object placed
+	 * here by job_export() is a MACH_PORT_NULL placeholder anyway (real
+	 * Mach service ports are never transferred through the checkin
+	 * message itself), and launch_msg()'s own launch_mach_checkin_service()
+	 * overwrites it in place, via this same int64-backed
+	 * launch_data_set_machport(), with the real port obtained from a
+	 * live bootstrap_check_in() before the caller ever reads it back. */
+	if (pd_launch_xpc_type_is(d, XPC_TYPE_INT64, "int64")) {
+		return (mach_port_t)((struct pd_launch_xpc_object *)d)->xo_u.i;
+	}
+
 	return xpc_object_get_machport(d);
 }
 
