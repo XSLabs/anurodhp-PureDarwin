@@ -15,6 +15,49 @@
  * waiting for carrier (DCD) - that carrier-wait is exactly the intermittent
  * "sometimes I get a shell, sometimes I don't" boot hang - then force CLOCAL
  * (ignore carrier), clear O_NONBLOCK, and acquire the controlling terminal.
+ *
+ * DAR-165 (real getty -> login -> shell chain): the default exec target is
+ * now real /bin/getty (third_party/system_cmds/getty.tproj, built by
+ * tools/userland_staging/build_getty.sh), not login directly. getty owns
+ * the interactive part of real Apple's architecture -- printing the
+ * hostname/"login:" banner and reading a username -- then does its own
+ * real, unmodified execle(LO, "login", "-p1"/"-fp1", name, ..., env)
+ * handoff (third_party/system_cmds/getty.tproj/main.c) to the exact same
+ * real /usr/bin/login DAR-164 already proved.
+ *
+ * Real DEVIATION from genuine Apple boot architecture, and why: real Apple
+ * launchd (com.apple.getty.plist, third_party/system_cmds/getty.tproj/
+ * com.apple.getty.plist) invokes getty directly on /dev/console with
+ * ProgramArguments ["/usr/libexec/getty", "std.9600", "console"] -- getty
+ * itself does chown/chmod/revoke + a *blocking* open() of the tty device
+ * (opentty(), getty.tproj/main.c) with no non-blocking/CLOCAL handling
+ * unless a gettytab "nc" flag is set. That blocking open on a carrier-
+ * sensitive device is EXACTLY the mechanism this file's own header (above)
+ * documents fixing as a real, previously-observed intermittent boot hang.
+ * Handing /dev/console to launchd->getty directly would very likely
+ * reintroduce that regression. So this helper keeps doing its own
+ * already-fixed, already-QEMU-serial-tuned tty acquisition (non-blocking
+ * open, force CLOCAL, drop O_NONBLOCK, TIOCSCTTY) and then execs getty in
+ * real getty's own documented "old style" mode (argv[2] == "-": "the file
+ * descriptors are already set up for us", see main.c's own comment on that
+ * exact branch) so getty's real opentty()/chown/revoke/blocking-open path
+ * is skipped entirely -- getty reuses the fd 0/1/2 already wired up here.
+ * This is a real, load-bearing engineering trade-off (documented here, not
+ * guessed): genuine getty->login exec semantics for the part that matters
+ * (the interactive login: prompt + real login(1) handoff), without
+ * regressing a real, already-fixed hang in the part that doesn't need to
+ * move (tty acquisition on this port's specific serial console).
+ *
+ * Fallback during the transition (per DAR-165's own explicit instruction:
+ * keep the ability to skip the new getty layer until it's QEMU-verified
+ * end to end): pass argv[1] == "-direct-login" to skip getty and exec
+ * /usr/bin/login directly instead, exactly DAR-164's already-committed
+ * behavior. org.puredarwin.console-login-direct.plist (Disabled, not
+ * loaded by default -- see inject_into_sd_image.sh) selects this mode;
+ * flip it to the active LaunchDaemon (and disable the getty one) to fall
+ * back without rebuilding anything. Once the real getty chain is
+ * QEMU-verified (bad password rejected, good password reaches an
+ * authenticated shell), this fallback plist/flag can be retired.
  */
 #include <sys/ioctl.h>
 #include <errno.h>
@@ -37,9 +80,10 @@ ctrace(const char *msg)
 }
 
 int
-main(void)
+main(int argc, char *argv[])
 {
 	const char *tty = "/dev/console";
+	int direct_login = (argc > 1 && strcmp(argv[1], "-direct-login") == 0);
 
 	g_trace_fd = open(tty, O_WRONLY | O_NOCTTY | O_NONBLOCK);
 	ctrace("pd-console-login: start\n");
@@ -111,9 +155,27 @@ main(void)
 	setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
 	setenv("TERM", "vt220", 0);
 
-	char *argv[] = { "/usr/bin/login", NULL };
-	ctrace("pd-console-login: exec /usr/bin/login\n");
-	execv(argv[0], argv);
-	ctrace("pd-console-login: execv failed\n");
+	if (direct_login) {
+		/* DAR-165 fallback path: skip getty, exec login directly.
+		 * Exactly DAR-164's original behavior, kept available via
+		 * org.puredarwin.console-login-direct.plist until the real
+		 * getty chain below is QEMU-verified end to end. */
+		char *login_argv[] = { "/usr/bin/login", NULL };
+		ctrace("pd-console-login: exec /usr/bin/login (direct, fallback)\n");
+		execv(login_argv[0], login_argv);
+		ctrace("pd-console-login: execv login failed\n");
+		_exit(127);
+	}
+
+	/* DAR-165 primary path: hand off to real getty in its own "old
+	 * style" mode (argv[2] == "-") so it reuses the controlling tty
+	 * already set up above instead of re-opening/revoking /dev/console
+	 * itself (see this file's header comment for why). getty prints
+	 * the login: prompt, reads a username, and does its own real
+	 * execle(LO, "login", ...) handoff to the same /usr/bin/login. */
+	char *getty_argv[] = { "getty", "default", "-", NULL };
+	ctrace("pd-console-login: exec /bin/getty\n");
+	execv("/bin/getty", getty_argv);
+	ctrace("pd-console-login: execv getty failed\n");
 	_exit(127);
 }
