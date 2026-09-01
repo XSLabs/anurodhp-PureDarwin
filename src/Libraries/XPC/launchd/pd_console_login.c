@@ -4,7 +4,11 @@
  * launchd opens StandardInPath with O_NOCTTY, so a direct /bin/zsh
  * LaunchDaemon has file descriptors for /dev/console but no controlling tty.
  * Keep the tty setup out of PID 1: launchd supervises this helper, and this
- * helper creates the console session then execs the real login shell.
+ * helper creates the console session then execs real login(1)
+ * (/usr/bin/login, third_party/system_cmds/login.tproj -- DAR-164), which
+ * does the actual username+password prompt/account lookup/credential drop
+ * and only then execs the authenticated account's real shell. Before
+ * DAR-164 this execed /bin/bash directly as root with zero prompt at all.
  *
  * The tty setup follows the classic getty dance so it is robust on a serial
  * console (serial=3): open NON-BLOCKING so we never wedge in the tty open
@@ -84,29 +88,31 @@ main(void)
 		(void)close(fd);
 	}
 
-	setenv("HOME", "/var/root", 1);
-	setenv("USER", "root", 1);
-	setenv("LOGNAME", "root", 1);
-	/* iokit project: no /bin/zsh on this image -- real bash 3.2 is this
-	 * project's actual shell, installed at both /bin/bash and /bin/sh. */
-	setenv("SHELL", "/bin/bash", 1);
+	/* iokit project / DAR-164: this used to setenv() a hardcoded root
+	 * identity and exec /bin/bash directly -- zero username/password
+	 * prompt at all. Real login(1) (third_party/system_cmds/login.tproj,
+	 * see tools/userland_staging/build_login.sh) now does that real
+	 * prompt+auth (crypt(3) against real /etc/master.passwd, same
+	 * account DB pwtool provisions/edits) and, on success, sets
+	 * LOGNAME/USER/HOME/SHELL/PATH itself for the REAL authenticated
+	 * account -- not always root -- and execs that account's real
+	 * shell. PATH/TERM are still set here as login(1)'s own real
+	 * pre-auth environment (real login.c preserves TERM across its
+	 * `environ = envinit` reset when not passed -p; PATH gets
+	 * overwritten unconditionally by login.c itself once an account is
+	 * known, real _PATH_STDPATH/_PATH_DEFPATH by uid, so this PATH
+	 * value is only ever visible to login.c's own pre-auth code path,
+	 * never to the eventual shell). XDG_RUNTIME_DIR is deliberately no
+	 * longer set here -- real login.c's own `environ = envinit` wipes it
+	 * before the shell exec regardless (matches real login(1) semantics,
+	 * not a regression); a per-account XDG_RUNTIME_DIR is a real,
+	 * separate follow-up if ever needed.
+	 */
 	setenv("PATH", "/bin:/sbin:/usr/bin:/usr/sbin", 1);
 	setenv("TERM", "vt220", 0);
-	{
-		char runtime_dir[64];
-		if (snprintf(runtime_dir, sizeof(runtime_dir), "/tmp/runtime-%u",
-		             (unsigned)getuid()) < (int)sizeof(runtime_dir)) {
-			if (mkdir(runtime_dir, 0700) < 0 && errno != EEXIST)
-				ctrace("pd-console-login: XDG runtime mkdir failed\n");
-			else if (chmod(runtime_dir, 0700) < 0)
-				ctrace("pd-console-login: XDG runtime chmod failed\n");
-			else
-				setenv("XDG_RUNTIME_DIR", runtime_dir, 1);
-		}
-	}
 
-	char *argv[] = { "/bin/bash", "-l", NULL };
-	ctrace("pd-console-login: exec /bin/bash\n");
+	char *argv[] = { "/usr/bin/login", NULL };
+	ctrace("pd-console-login: exec /usr/bin/login\n");
 	execv(argv[0], argv);
 	ctrace("pd-console-login: execv failed\n");
 	_exit(127);
