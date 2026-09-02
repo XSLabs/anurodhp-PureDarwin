@@ -783,18 +783,87 @@ launchd_close(launch_t lh, typeof(close) closefunc)
 
 #define ROUND_TO_64BIT_WORD_SIZE(x)	((x + 7) & ~7)
 
+/* Real Apple liblaunch's launch_data_pack()/launch_data_unpack() serialize ANY
+ * launch_data_t, scalars included: the wire format is a recursive walk over the
+ * launch_data union, and a bare top-level scalar is a completely legitimate
+ * message. The liblaunch IPC protocol genuinely relies on that -- the check-in
+ * request every launchd-managed daemon sends is a bare LAUNCH_DATA_STRING
+ * (syslogd: launch_msg(launch_data_new_string(LAUNCH_KEY_CHECKIN))), and
+ * launchd's own ipc_readmsg() explicitly branches on receiving a bare
+ * LAUNCH_DATA_STRING. launchd's error replies (launch_data_new_errno(), a
+ * LAUNCH_DATA_ERRNO) are bare scalars too.
+ *
+ * This PureDarwin reimplementation is instead built on top of xpc2nv()/
+ * nvlist_pack(), and an nvlist has no representation for a bare scalar at top
+ * level -- xpc2nv() hard-asserts unless handed a dictionary or an array. Hence
+ * the container-only guard that used to live here, which made every scalar
+ * message unsendable (pack returns 0 -> launchd_msg_send() fails ENOMEM ->
+ * launch_msg() returns NULL before ever reaching sendmsg()).
+ *
+ * Fix: transparently box a top-level scalar in a single-entry dictionary under
+ * a reserved key, and unbox it in launch_data_unpack(). Both peers of this
+ * protocol (every client via liblaunch, and launchd itself via ipc.c) run this
+ * same code, so the boxing is symmetric and never escapes to the API surface.
+ * The key lives in the XPC reserved-key namespace so it cannot collide with a
+ * real message key, and unboxing additionally requires the dictionary to hold
+ * exactly that one entry. */
+/* Literal rather than XPC_RESERVED_KEY_PREFIX: that macro lives in the private
+ * xpc_internal.h, which this translation unit deliberately does not include
+ * (it only forward-declares xpc2nv/nv2xpc above). Keep this prefix in sync with
+ * xpc_internal.h's XPC_RESERVED_KEY_PREFIX. It must NOT collide with
+ * xpc_dictionary.c's NVLIST_XPC_TYPE (<prefix> "object type"), which
+ * xpc_dictionary_set_value() refuses and nv2xpc() interprets as a type tag. */
+#define PD_LAUNCH_SCALAR_BOX_KEY	"__xpc_internal__:launch_data_scalar"
+
+/* Only box scalars xpc2nv_primitive() can actually serialize. It calls
+ * xpc_api_misuse() -- which aborts -- for XPC_TYPE_SHMEM, XPC_TYPE_ERROR and
+ * anything it does not recognise, and for XPC_TYPE_FD/CONNECTION/ENDPOINT it
+ * defers to launch_data_pack()'s port_serializer block, which aborts too. The
+ * container-only guard used to turn every one of those into a graceful
+ * errno=EINVAL return, and that must not regress into an abort: this code runs
+ * inside PID 1, where dying takes the kernel with it (see launch_data_alloc()'s
+ * own note on exactly this hazard for LAUNCH_DATA_MACHPORT). So allowlist the
+ * types known to round-trip, and keep the old EINVAL for everything else.
+ * Note LAUNCH_DATA_FD/MACHPORT/ERRNO are all backed by plain int64/uint64
+ * objects here (see launch_data_alloc()), so they are covered by the numeric
+ * cases below rather than by the aborting XPC_TYPE_FD path. */
+static bool
+pd_launch_scalar_is_packable(launch_data_t d)
+{
+	return pd_launch_xpc_type_is(d, XPC_TYPE_STRING, "string") ||
+			pd_launch_xpc_type_is(d, XPC_TYPE_INT64, "int64") ||
+			pd_launch_xpc_type_is(d, XPC_TYPE_UINT64, "uint64") ||
+			pd_launch_xpc_type_is(d, XPC_TYPE_BOOL, "bool") ||
+			pd_launch_xpc_type_is(d, XPC_TYPE_DOUBLE, "double") ||
+			pd_launch_xpc_type_is(d, XPC_TYPE_DATA, "data") ||
+			pd_launch_xpc_type_is(d, XPC_TYPE_UUID, "UUID") ||
+			pd_launch_xpc_type_is(d, XPC_TYPE_DATE, "date");
+}
+
 size_t
 launch_data_pack(launch_data_t d, void *where, size_t len, int *fd_where, size_t *fd_cnt)
 {
+	launch_data_t box = NULL, topack = d;
+
 	if (!pd_launch_xpc_type_is(d, XPC_TYPE_DICTIONARY, "dictionary") &&
 			!pd_launch_xpc_type_is(d, XPC_TYPE_ARRAY, "array")) {
-		pd_liblaunch_phase("launch_data_pack refused non-container object=%p type=%s",
-				d, pd_launch_xpc_type_name(d));
-		errno = EINVAL;
-		return 0;
+		if (!pd_launch_scalar_is_packable(d)) {
+			pd_liblaunch_phase("launch_data_pack refused unserializable object=%p type=%s",
+					d, pd_launch_xpc_type_name(d));
+			errno = EINVAL;
+			return 0;
+		}
+		if ((box = (launch_data_t)xpc_dictionary_create(NULL, NULL, 0)) == NULL) {
+			errno = ENOMEM;
+			return 0;
+		}
+		/* set_value retains d; releasing the box below drops that ref, so
+		 * the caller's ownership of d is unchanged. */
+		xpc_dictionary_set_value(box, PD_LAUNCH_SCALAR_BOX_KEY, d);
+		topack = box;
 	}
 
-	nvlist_t *nvl = xpc2nv((struct xpc_object *)d, ^int64_t(mach_port_t port) {
+	nvlist_t *nvl = xpc2nv((struct xpc_object *)topack, ^int64_t(mach_port_t port) {
 		xpc_api_misuse("Cannot currently serialize mach ports in launch_data_pack()");
 	});
 
@@ -806,6 +875,9 @@ launch_data_pack(launch_data_t d, void *where, size_t len, int *fd_where, size_t
 
 	free(data);
 	nvlist_destroy(nvl);
+	if (box) {
+		xpc_release(box);
+	}
 
 	return size;
 }
@@ -826,6 +898,22 @@ launch_data_unpack(void *data, size_t data_size, int *fds, size_t fd_cnt, size_t
 		xpc_api_misuse("Should not be called");
 	});
 	nvlist_destroy(nvl);
+
+	/* Undo launch_data_pack()'s scalar boxing. Require the dictionary to hold
+	 * exactly the one reserved entry, so a real single-key message dictionary
+	 * can never be mistaken for a box. */
+	if (xo != NULL && pd_launch_xpc_type_is(xo, XPC_TYPE_DICTIONARY, "dictionary") &&
+			xpc_dictionary_get_count(xo) == 1) {
+		xpc_object_t inner = xpc_dictionary_get_value(xo, PD_LAUNCH_SCALAR_BOX_KEY);
+		if (inner != NULL) {
+			/* get_value returns a borrowed ref; retain it before the box
+			 * that owns it goes away. */
+			xpc_retain(inner);
+			xpc_release(xo);
+			xo = inner;
+		}
+	}
+
 	if (data_offset) {
 		*data_offset = data_size;
 	}
