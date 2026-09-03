@@ -294,11 +294,19 @@ ipc_close_fds(launch_data_t o)
 		for (i = 0; i < launch_data_array_get_count(o); i++)
 			ipc_close_fds(launch_data_array_get_index(o, i));
 		break;
-	case LAUNCH_DATA_FD:
-		if (launch_data_get_fd(o) != -1) {
-			(void)runtime_close(launch_data_get_fd(o));
+	case LAUNCH_DATA_FD: {
+		/* DAR-202: launch_data_get_fd() is xpc_fd_dup() in this port -- it
+		 * MINTS a new descriptor from the object's fileport rather than
+		 * returning a stored one. Calling it twice (once for the != -1 test,
+		 * once for the close, as this did) therefore leaks one descriptor per
+		 * entry. Harmless while no request could carry a descriptor at all;
+		 * real now that launch_data_pack()/unpack() transport them. */
+		int fd = launch_data_get_fd(o);
+		if (fd != -1) {
+			(void)runtime_close(fd);
 		}
 		break;
+	}
 	default:
 		break;
 	}

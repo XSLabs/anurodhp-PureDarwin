@@ -11900,6 +11900,15 @@ job_mig_legacy_ipc_request(job_t j, vm_offset_t request,
 	mach_msg_type_number_t *reply_fdsCnt, mach_port_t asport)
 {
 	size_t nout_fds = 0;
+	/* DAR-202: launch_data_pack() now really does serialise descriptors, and
+	 * the ones it hands back are freshly created and owned by this caller (it
+	 * has to mint them from the launch_data's fileport -- see liblaunch.c's
+	 * launch_data_pack() header comment). nout_fds_open tracks how many of
+	 * out_fds[] this function still has to close, so both the success path and
+	 * out_bad drop them exactly once. Declared up here because out_bad is
+	 * reachable from before the pack. */
+	size_t nout_fds_open = 0;
+	int out_fds[LAUNCHD_MAX_LEGACY_FDS];
 
 	if (!j) {
 		return BOOTSTRAP_NO_MEMORY;
@@ -11951,8 +11960,10 @@ job_mig_legacy_ipc_request(job_t j, vm_offset_t request,
 		goto out_bad;
 	}
 
-	int out_fds[LAUNCHD_MAX_LEGACY_FDS];
 	size_t sz = launch_data_pack(ldreply, (void *)*reply, *replyCnt, out_fds, &nout_fds);
+	/* Set before the failure check: launch_data_pack() reports nout_fds even
+	 * when it fails, and those descriptors still need closing. */
+	nout_fds_open = nout_fds;
 	if (!sz) {
 		job_log(j, LOG_ERR, "Could not pack legacy IPC reply.");
 		goto out_bad;
@@ -11983,6 +11994,13 @@ job_mig_legacy_ipc_request(job_t j, vm_offset_t request,
 			(*reply_fdps)[i] = fp;
 		}
 
+		/* Descriptors are now represented by the fileports in *reply_fdps;
+		 * drop this process's own copies (DAR-202 ownership contract). */
+		for (i = 0; i < nout_fds; i++) {
+			(void)close(out_fds[i]);
+		}
+		nout_fds_open = 0;
+
 		nout_fdps = nout_fds;
 	} else {
 		*reply_fdsCnt = 0;
@@ -12002,8 +12020,19 @@ out_bad:
 		(void)close(in_fds[i]);
 	}
 
-	for (i = 0; i < nout_fds; i++) {
-		(void)launchd_mport_deallocate((*reply_fdps)[i]);
+	for (i = 0; i < nout_fds_open; i++) {
+		(void)close(out_fds[i]);
+	}
+	nout_fds_open = 0;
+
+	/* *reply_fdps is only populated after the mig_allocate() below the pack;
+	 * nout_fds is nonzero before that, so this must not be an unconditional
+	 * dereference (DAR-202: it never used to be reachable with nout_fds != 0
+	 * because launch_data_pack() could not serialise descriptors at all). */
+	if (*reply_fdps) {
+		for (i = 0; i < nout_fds; i++) {
+			(void)launchd_mport_deallocate((*reply_fdps)[i]);
+		}
 	}
 
 	if (*reply) {

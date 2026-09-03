@@ -167,6 +167,18 @@ nv2xpc(const nvlist_t *nv, mach_port_t (^port_deserializer)(int64_t port_id))
 	return (xo);
 }
 
+/* DAR-202: the five type-tagged inner nvlists below (connection/endpoint/
+ * fileport/date/double) are added with nvlist_add_nvlist_DICTIONARY, not plain
+ * nvlist_add_nvlist. nvlist_add_nvlist() tags the pair NV_TYPE_NVLIST (13), and
+ * nv2xpc()'s per-pair switch only has cases for NV_TYPE_NVLIST_ARRAY (14) and
+ * NV_TYPE_NVLIST_DICTIONARY (15) -- so every one of these entries used to be
+ * silently DROPPED on the receiving side, with no error anywhere. Verified by
+ * a real pack/unpack round trip against this tree's own libnv: an
+ * nvlist_add_nvlist() child comes back as pair type 13 (its own nvlist_type is
+ * 15, so nv2xpc()'s entry assert would have been fine -- it simply never got
+ * called). Nothing had noticed because the only producers of these tags are
+ * XPC_TYPE_FD/CONNECTION/ENDPOINT (whose serializer aborted outright until
+ * DAR-202) plus date/double (never round-tripped through this path). */
 static void
 xpc2nv_primitive(nvlist_t *nv, const char *key, xpc_object_t value, int64_t (^port_serializer)(mach_port_t port))
 {
@@ -183,13 +195,13 @@ xpc2nv_primitive(nvlist_t *nv, const char *key, xpc_object_t value, int64_t (^po
 		inner_nv = nvlist_create_dictionary(0);
 		nvlist_add_string(inner_nv, NVLIST_XPC_TYPE, "connection");
 		nvlist_add_int64(inner_nv, NVLIST_PORT_INDEX, port_serializer(xotmp->xo_port));
-		nvlist_add_nvlist(nv, key, inner_nv);
+		nvlist_add_nvlist_dictionary(nv, key, inner_nv);
 		nvlist_destroy(inner_nv);
 	} else if (xotmp->xo_xpc_type == XPC_TYPE_ENDPOINT) {
 		inner_nv = nvlist_create_dictionary(0);
 		nvlist_add_string(inner_nv, NVLIST_XPC_TYPE, "endpoint");
 		nvlist_add_int64(inner_nv, NVLIST_PORT_INDEX, port_serializer(xotmp->xo_port));
-		nvlist_add_nvlist(nv, key, inner_nv);
+		nvlist_add_nvlist_dictionary(nv, key, inner_nv);
 		nvlist_destroy(inner_nv);
 	} else if (xotmp->xo_xpc_type == XPC_TYPE_INT64) {
 		nvlist_add_int64(nv, key, xpc_int64_get_value(xotmp));
@@ -199,7 +211,7 @@ xpc2nv_primitive(nvlist_t *nv, const char *key, xpc_object_t value, int64_t (^po
 		inner_nv = nvlist_create_dictionary(0);
 		nvlist_add_string(inner_nv, NVLIST_XPC_TYPE, "date");
 		nvlist_add_int64(inner_nv, "date", xotmp->xo_u.i);
-		nvlist_add_nvlist(nv, key, inner_nv);
+		nvlist_add_nvlist_dictionary(nv, key, inner_nv);
 		nvlist_destroy(inner_nv);
 	} else if (xotmp->xo_xpc_type == XPC_TYPE_DATA) {
 		nvlist_add_binary(nv, key, xpc_data_get_bytes_ptr(xotmp), xpc_data_get_length(xotmp));
@@ -211,7 +223,7 @@ xpc2nv_primitive(nvlist_t *nv, const char *key, xpc_object_t value, int64_t (^po
 		inner_nv = nvlist_create_dictionary(0);
 		nvlist_add_string(inner_nv, NVLIST_XPC_TYPE, "fileport");
 		nvlist_add_int64(inner_nv, NVLIST_PORT_INDEX, port_serializer(xotmp->xo_port));
-		nvlist_add_nvlist(nv, key, inner_nv);
+		nvlist_add_nvlist_dictionary(nv, key, inner_nv);
 		nvlist_destroy(inner_nv);
 	} else if (xotmp->xo_xpc_type == XPC_TYPE_SHMEM) {
 		xpc_api_misuse("Cannot serialize object of type shared memory");
@@ -221,7 +233,7 @@ xpc2nv_primitive(nvlist_t *nv, const char *key, xpc_object_t value, int64_t (^po
 		inner_nv = nvlist_create_dictionary(0);
 		nvlist_add_string(inner_nv, NVLIST_XPC_TYPE, "double");
 		nvlist_add_binary(inner_nv, "double", &xotmp->xo_u.d, sizeof(double));
-		nvlist_add_nvlist(nv, key, inner_nv);
+		nvlist_add_nvlist_dictionary(nv, key, inner_nv);
 		nvlist_destroy(inner_nv);
 	} else {
 		xpc_api_misuse("Unknown XPC type for object");

@@ -36,6 +36,7 @@
 #include <sys/un.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
+#include <sys/fileport.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -840,10 +841,75 @@ pd_launch_scalar_is_packable(launch_data_t d)
 			pd_launch_xpc_type_is(d, XPC_TYPE_DATE, "date");
 }
 
+/* DAR-202: real out-of-band descriptor passing.
+ *
+ * Real Apple liblaunch never puts a descriptor (or a Mach port) in the packed
+ * message body. launch_data_pack() writes each LAUNCH_DATA_FD's raw fd into the
+ * caller's `fd_where` array and stores only that array *index* in the body;
+ * launchd_msg_send() then hands the array to sendmsg() as SCM_RIGHTS, and
+ * job_mig_legacy_ipc_request() (core.c) turns it into an array of fileports on
+ * the MIG reply. launch_data_unpack() reverses it, mapping index -> received
+ * fd. Mach ports are NOT transported at all: job_export() only ever emits
+ * MACH_PORT_NULL placeholders for MachServices, and the client resolves the
+ * real service ports itself via bootstrap_check_in() (see launch_msg() ->
+ * launch_mach_checkin_service()).
+ *
+ * Both halves of that were missing here: the port_serializer/port_deserializer
+ * blocks were hard xpc_api_misuse() aborts, so the very first real check-in
+ * reply carrying a Sockets dictionary (syslogd's BSDSystemLogger) killed PID 1
+ * and panicked the kernel. The receive-side plumbing (lh->recvfds/recvfdcnt ->
+ * launch_data_unpack) and the send-side plumbing (lh->sendfds/sendfdcnt ->
+ * SCM_RIGHTS) were both already complete and wired up; only these two blocks
+ * were stubs. Note the abort's wording ("Cannot currently serialize mach
+ * ports") was misleading: xpc2nv_primitive() routes XPC_TYPE_FD through the
+ * same port_serializer block as XPC_TYPE_CONNECTION/XPC_TYPE_ENDPOINT, and it
+ * is the *fd* case (job_export()'s for_checkin xpc_fd_create()) that fires.
+ *
+ * Ownership contract, and where it differs from real Apple's: our XPC_TYPE_FD
+ * object stores a fileport, not the original descriptor (xpc_fd_create() ->
+ * fileport_makeport()), so the serializer has to materialise a descriptor with
+ * fileport_makefd(). That descriptor is *newly created* and owned by the caller
+ * of launch_data_pack(), which must close every slot in fd_where once the
+ * message has been handed off. Apple's version writes the launch_data's own
+ * long-lived fd and so needs no close. Both in-tree callers do this:
+ * launchd_msg_send() below, and core.c's job_mig_legacy_ipc_request().
+ *
+ * The cap exists because the API gives launch_data_pack() no length for
+ * fd_where. 128 is the smallest buffer any real caller offers
+ * (core.c's `int out_fds[LAUNCHD_MAX_LEGACY_FDS]`), so capping here keeps that
+ * stack array from overflowing; launchd_msg_send()'s own buffer is far larger.
+ */
+#define PD_LAUNCH_MAX_PACKED_FDS	128
+
+/* Drop this process's copies of the descriptors launch_data_pack() created.
+ * errno-preserving so it can be used on error paths. */
+static void
+pd_launch_close_packed_fds(int *fds, size_t cnt)
+{
+	int saved_errno = errno;
+	size_t i;
+
+	if (fds == NULL) {
+		return;
+	}
+	for (i = 0; i < cnt; i++) {
+		if (fds[i] >= 0) {
+			(void)close(fds[i]);
+			fds[i] = -1;
+		}
+	}
+	errno = saved_errno;
+}
+
 size_t
 launch_data_pack(launch_data_t d, void *where, size_t len, int *fd_where, size_t *fd_cnt)
 {
 	launch_data_t box = NULL, topack = d;
+	__block size_t fds_used = 0;
+
+	if (fd_cnt) {
+		*fd_cnt = 0;
+	}
 
 	if (!pd_launch_xpc_type_is(d, XPC_TYPE_DICTIONARY, "dictionary") &&
 			!pd_launch_xpc_type_is(d, XPC_TYPE_ARRAY, "array")) {
@@ -864,7 +930,33 @@ launch_data_pack(launch_data_t d, void *where, size_t len, int *fd_where, size_t
 	}
 
 	nvlist_t *nvl = xpc2nv((struct xpc_object *)topack, ^int64_t(mach_port_t port) {
-		xpc_api_misuse("Cannot currently serialize mach ports in launch_data_pack()");
+		/* Reached for XPC_TYPE_FD (a fileport, serialised out-of-band below)
+		 * and for XPC_TYPE_CONNECTION/XPC_TYPE_ENDPOINT (real Mach ports,
+		 * which this wire format deliberately cannot carry -- see the header
+		 * comment). Index -1 means "nothing was transported"; unpack turns it
+		 * back into a MACH_PORT_NULL-backed object. It must never abort: this
+		 * code runs inside PID 1, where dying panics the kernel. */
+		if (fd_where == NULL) {
+			pd_liblaunch_phase("launch_data_pack: caller offered no fd slots, dropping port 0x%x", port);
+			return (int64_t)-1;
+		}
+		if (fds_used >= PD_LAUNCH_MAX_PACKED_FDS) {
+			pd_liblaunch_phase("launch_data_pack: more than %d descriptors in one message, dropping the rest",
+					PD_LAUNCH_MAX_PACKED_FDS);
+			return (int64_t)-1;
+		}
+
+		int fd = fileport_makefd(port);
+		if (fd < 0) {
+			/* Not a fileport: a real connection/endpoint port. Nothing to do
+			 * but drop it -- the legacy launch_data protocol has no transport
+			 * for Mach ports, by design. */
+			pd_liblaunch_phase("launch_data_pack: fileport_makefd(0x%x) failed errno=%d, dropping", port, errno);
+			return (int64_t)-1;
+		}
+
+		fd_where[fds_used] = fd;
+		return (int64_t)(fds_used++);
 	});
 
 	size_t size;
@@ -879,6 +971,12 @@ launch_data_pack(launch_data_t d, void *where, size_t len, int *fd_where, size_t
 		xpc_release(box);
 	}
 
+	/* Always reported, including on the size==0 failure return: the caller owns
+	 * (and must close) whatever the serializer already created. */
+	if (fd_cnt) {
+		*fd_cnt = fds_used;
+	}
+
 	return size;
 }
 
@@ -886,6 +984,11 @@ launch_data_t
 launch_data_unpack(void *data, size_t data_size, int *fds, size_t fd_cnt, size_t *data_offset, size_t *fdoffset)
 {
 	size_t offset = data_offset ? *data_offset : 0;
+	__block size_t fds_consumed = 0;
+
+	if (fdoffset) {
+		*fdoffset = 0;
+	}
 	if (offset > data_size) {
 		return NULL;
 	}
@@ -895,7 +998,28 @@ launch_data_unpack(void *data, size_t data_size, int *fds, size_t fd_cnt, size_t
 		return NULL;
 	}
 	xpc_object_t xo = (xpc_object_t)nv2xpc(nvl, ^mach_port_t(int64_t port_id) {
-		xpc_api_misuse("Should not be called");
+		/* DAR-202, the receive half of launch_data_pack()'s out-of-band
+		 * descriptor passing. `fds` are the descriptors the transport already
+		 * received (SCM_RIGHTS in launchd_msg_recv(), fileport_makefd()'d MIG
+		 * request descriptors in core.c); nv2xpc() wants a fileport back so
+		 * the resulting XPC_TYPE_FD answers xpc_fd_dup()/launch_data_get_fd().
+		 * The raw descriptors stay owned by the caller. */
+		mach_port_t p = MACH_PORT_NULL;
+
+		if (port_id < 0 || fds == NULL || (uint64_t)port_id >= (uint64_t)fd_cnt) {
+			pd_liblaunch_phase("launch_data_unpack: descriptor index %lld out of range (have %zu)",
+					(long long)port_id, fd_cnt);
+			return MACH_PORT_NULL;
+		}
+		if (fileport_makeport(fds[port_id], &p) != 0) {
+			pd_liblaunch_phase("launch_data_unpack: fileport_makeport(fd=%d) failed errno=%d",
+					fds[port_id], errno);
+			return MACH_PORT_NULL;
+		}
+		if ((size_t)port_id + 1 > fds_consumed) {
+			fds_consumed = (size_t)port_id + 1;
+		}
+		return p;
 	});
 	nvlist_destroy(nvl);
 
@@ -918,7 +1042,7 @@ launch_data_unpack(void *data, size_t data_size, int *fds, size_t fd_cnt, size_t
 		*data_offset = data_size;
 	}
 	if (fdoffset) {
-		*fdoffset = 0;
+		*fdoffset = fds_consumed;
 	}
 	return xo;
 }
@@ -969,6 +1093,9 @@ launchd_msg_send(launch_t lh, launch_data_t d)
 		lh->sendlen = launch_data_pack(d, lh->sendbuf, good_enough_size, lh->sendfds, &fd_slots_used);
 
 		if (lh->sendlen == 0) {
+			/* launch_data_pack() reports fd_slots_used even when it fails, and
+			 * those descriptors are ours to close. */
+			pd_launch_close_packed_fds(lh->sendfds, fd_slots_used);
 			errno = ENOMEM;
 			return -1;
 		}
@@ -1006,7 +1133,15 @@ launchd_msg_send(launch_t lh, launch_data_t d)
 		memcpy(CMSG_DATA(cm), lh->sendfds, lh->sendfdcnt * sizeof(int));
 	}
 
-	if ((r = sendmsg(fd2use, &mh, 0)) == -1) {
+	r = sendmsg(fd2use, &mh, 0);
+
+	/* DAR-202: the descriptors in lh->sendfds were created by
+	 * launch_data_pack()'s serializer (fileport_makefd), not borrowed from the
+	 * caller -- see its header comment. sendmsg() has already copied them into
+	 * the receiving process, so drop our copies now, on every path below. */
+	pd_launch_close_packed_fds(lh->sendfds, lh->sendfdcnt);
+
+	if (r == -1) {
 		return -1;
 	} else if (r == 0) {
 		errno = ECONNRESET;
@@ -1369,6 +1504,14 @@ launchd_msg_recv(launch_t lh, void (*cb)(launch_data_t, void *), void *context)
 			free(lh->recvbuf);
 			lh->recvbuf = malloc(0);
 		}
+
+		/* DAR-202: launch_data_unpack() turned each consumed descriptor into a
+		 * fileport held by the resulting XPC_TYPE_FD object, so the raw
+		 * SCM_RIGHTS descriptor is redundant from here on -- and it is about to
+		 * be shifted out of lh->recvfds, so this is the last chance to close
+		 * it. launch_data_get_fd()/xpc_fd_dup() mints a fresh descriptor from
+		 * the fileport when the consumer actually wants one. */
+		pd_launch_close_packed_fds(lh->recvfds, fd_offset);
 
 		lh->recvfdcnt -= fd_offset;
 		if (lh->recvfdcnt > 0) {
