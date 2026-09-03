@@ -7,6 +7,7 @@
 #include "launch.h"
 #include "launch_priv.h"
 #include "core.h"
+#include "log.h"
 
 static void
 pd_launchd_boot_mkdir_p(const char *path, mode_t mode)
@@ -52,14 +53,30 @@ struct pd_hfs_mount_args_stub {
 	int journal_disable;
 };
 
+/* iokit project, DAR-219: report through launchd_syslog(... | LOG_CONSOLE),
+ * NOT fprintf(stderr)/perror(). As PID 1 this runs before anything has
+ * arranged a useful stderr, so a failing remount used to produce NO output
+ * at all -- while its downstream consequence (pd_pid1_prepare_legacy_ipc()'s
+ * mkdir("/var/tmp/") failing EROFS a few lines below) DID print, via
+ * launchd_syslog|LOG_CONSOLE. A real-hardware boot log therefore showed the
+ * symptom with its cause invisible, which is exactly the ambiguity DAR-219
+ * had to be investigated to resolve. Log the success case too: silence is
+ * not distinguishable from "never ran" (this project has been burned by a
+ * diagnostic that shared its subject's failure mode before), and one line
+ * per boot is cheap next to re-running a real-hardware test to find out. */
 static void
 pd_launchd_boot_remount_root_rw(void)
 {
 	struct pd_hfs_mount_args_stub args;
 	memset(&args, 0, sizeof(args));
 	if (mount("hfs", "/", 0, &args) < 0) {
-		fprintf(stderr, "pd_launchd_boot: remount / read-write failed: ");
-		perror("");
+		launchd_syslog(LOG_ERR | LOG_CONSOLE,
+				"pd_launchd_boot: remount / read-write failed: %s "
+				"(root stays read-only; expect EROFS from every write below)",
+				strerror(errno));
+	} else {
+		launchd_syslog(LOG_NOTICE | LOG_CONSOLE,
+				"pd_launchd_boot: remounted / read-write");
 	}
 }
 
