@@ -221,6 +221,16 @@ launchd_vsyslog(struct launchd_syslog_attr *attr, const char *fmt, va_list args)
 	vsnprintf(message, sizeof(message), fmt, args);
 	if (echo2console && launchd_console) {
 		fprintf(launchd_console, "%-32s %-8u %-64s %-8u  %s\n", attr->from_name, attr->from_pid, attr->about_name, attr->about_pid, message);
+		/* Found investigating DAR-270: this stream is never otherwise
+		 * flushed on the normal per-message path (only at a few specific
+		 * call sites elsewhere in launchd.c), so a LOG_CONSOLE message
+		 * can sit in stdio's buffer indefinitely instead of reaching the
+		 * real console -- the exact "diagnostic channel silently
+		 * swallows its own output" failure mode this project has been
+		 * burned by before. Flush every LOG_CONSOLE message immediately;
+		 * this is a real, general fix, not specific to DAR-270's own
+		 * investigation. */
+		fflush(launchd_console);
 	}
 
 	if (log2here) {
