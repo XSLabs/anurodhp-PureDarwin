@@ -3694,6 +3694,10 @@ job_reap(job_t j)
 	bool is_system_bootstrapper = ((j->is_bootstrapper && pid1_magic) && !j->mgr->parentmgr);
 
 	job_log(j, LOG_DEBUG, "Reaping");
+	pd_core_phase("job_reap(%s) pid=%d last_exit_status=0x%x exited=%d code=%d signaled=%d sig=%d checkedin=%d",
+			j->label, j->p, j->last_exit_status,
+			WIFEXITED(j->last_exit_status), WEXITSTATUS(j->last_exit_status),
+			WIFSIGNALED(j->last_exit_status), WTERMSIG(j->last_exit_status), j->checkedin);
 
 	if (unlikely(j->weird_bootstrap)) {
 		int64_t junk = 0;
@@ -4110,6 +4114,7 @@ job_dispatch(job_t j, bool kickstart)
 
 		if (kickstart || job_keepalive(j)) {
 			job_log(j, LOG_DEBUG, "%starting job", kickstart ? "Kicks" : "S");
+			pd_core_phase("job_dispatch(%s): starting (kickstart=%d)", j->label, kickstart);
 			job_start(j);
 		} else {
 			job_log(j, LOG_DEBUG, "Watching job.");
@@ -7620,6 +7625,8 @@ job_ack_port_destruction(mach_port_t p)
 	j = ms->job;
 
 	jobmgr_log(root_jobmgr, LOG_DEBUG, "Receive right returned to us: %s", ms->name);
+	pd_core_phase("port_destroyed(%s) job=%s j->p=%d isActive=%d reaped=%d",
+			ms->name, j->label, j->p, ms->isActive, j->reaped);
 
 	/* Without being the exception handler, NOTE_EXIT is our only way to tell if
 	 * the job  crashed, and we can't rely on NOTE_EXIT always being processed
@@ -9137,6 +9144,11 @@ job_mig_check_in2(job_t j, name_t servicename, mach_port_t *serviceportp, uuid_t
 		ms = jobmgr_lookup_service(j->mgr, servicename, false, per_pid_service ? ldc->pid : 0);
 	}
 
+	pd_core_phase("check_in2(%s) caller_job=%s j=%p j->p=%d ldc_pid=%d ms=%p ms->job=%s ms->job->p=%d ms->isActive=%d ms->recv=%d strict=%d",
+			servicename, j->label, j, j->p, ldc ? ldc->pid : -1,
+			ms, ms ? ms->job->label : "(none)", ms ? ms->job->p : -1,
+			ms ? ms->isActive : -1, ms ? ms->recv : -1, strict);
+
 	if (strict) {
 		if (likely(ms != NULL)) {
 			if (ms->job != j) {
@@ -9202,6 +9214,7 @@ owner_checkin:
 						servicename, j ? j->label : "(null)", ldc ? ldc->pid : -1);
 			}
 			job_log(j, LOG_WARNING, "Check-in of Mach service failed. Already active: %s", servicename);
+			pd_core_phase("check_in2(%s) -> SERVICE_ACTIVE pid=%d", servicename, ldc ? ldc->pid : -1);
 			return BOOTSTRAP_SERVICE_ACTIVE;
 		}
 	}
@@ -9212,6 +9225,7 @@ owner_checkin:
 	job_log(j, LOG_INFO, "Check-in of service: %s", servicename);
 
 	*serviceportp = machservice_port(ms);
+	pd_core_phase("check_in2(%s) -> SUCCESS pid=%d port=0x%x", servicename, ldc ? ldc->pid : -1, ms->port);
 	return BOOTSTRAP_SUCCESS;
 }
 
