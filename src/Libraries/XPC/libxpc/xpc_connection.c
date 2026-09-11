@@ -249,8 +249,22 @@ xpc_connection_send_message(xpc_connection_t xconn,
 	if (id == 0)
 		id = XPC_CONNECTION_NEXT_ID(conn);
 
+	/*
+	 * DAR-284: the send is asynchronous, so this connection -- not the
+	 * caller -- owns the message until it is actually on the wire. Real
+	 * XPC lets a caller release a message the moment send_message()
+	 * returns, and real callers do: configd's _dnsinfo_copy()
+	 * (third_party/configd/dnsinfo/dnsinfo_server.c) is
+	 * `xpc_connection_send_message(remote, reply); xpc_release(reply);`
+	 * back to back. Without this retain the block below ran against a
+	 * freed object and aborted the daemon inside xpc_pipe_send() --
+	 * "Bug in libxpc: xpc_object_t not of dictionary type", measured on
+	 * a real boot the moment the first XPC reply was ever sent here.
+	 */
+	xpc_retain(message);
 	dispatch_async(conn->xc_send_queue, ^{
 		xpc_send(conn, message, id);
+		xpc_release(message);
 	});
 }
 
@@ -278,8 +292,11 @@ xpc_connection_send_message_with_reply(xpc_connection_t xconn,
 		return;
 	}
 
+	/* DAR-284: same ownership rule as xpc_connection_send_message(). */
+	xpc_retain(message);
 	dispatch_async(conn->xc_send_queue, ^{
 		xpc_send(conn, message, call->xp_id);
+		xpc_release(message);
 	});
 
 }
@@ -450,8 +467,31 @@ xpc_send(xpc_connection_t xconn, xpc_object_t message, uint64_t id)
 	error_code = xpc_pipe_send(message, conn->xc_remote_port,
 	    conn->xc_local_port, id);
 
-	if (error_code != 0)
+	if (error_code != 0) {
 		debugf("send failed, errno=%s", strerror(error_code));
+
+		/*
+		 * DAR-284: a message that never left this task has no reply
+		 * coming, ever. Reporting that only through debugf() (an
+		 * os_log() that goes nowhere on a target with no logging
+		 * daemon) left xpc_connection_send_message_with_reply_sync()
+		 * parked in dispatch_semaphore_wait(DISPATCH_TIME_FOREVER)
+		 * with no output, no error and no exit -- which is exactly
+		 * how `scutil --dns` presented before the OOL-descriptor bug
+		 * underneath it was found: a silent, permanent hang in a
+		 * process that was still alive and using no CPU.
+		 *
+		 * Real XPC surfaces an undeliverable message as a connection
+		 * error, so do that: mark the connection invalid and hand
+		 * every outstanding reply handler (and the event handler)
+		 * XPC_ERROR_CONNECTION_INVALID. Callers that already check
+		 * for it -- libSystemConfiguration_client.c's own
+		 * `client->active = FALSE` path is the real one here -- then
+		 * fail fast instead of blocking forever.
+		 */
+		conn->xc_invalid = true;
+		xpc_connection_deliver_invalid(conn);
+	}
 }
 
 static void
@@ -521,15 +561,40 @@ xpc_connection_recv_message(void *context)
 
 		TAILQ_INSERT_TAIL(&conn->xc_peers, peer, xc_link);
 
-		dispatch_async(conn->xc_target_queue, ^{
-			conn->xc_handler(peer);
-		});
-
 		((struct xpc_object *)result)->xo_remote_connection = peer;
 
-		dispatch_async(peer->xc_target_queue, ^{
-			peer->xc_handler(result);
-			xpc_release(result);
+		/*
+		 * DAR-284: the first message on a new peer may only be
+		 * delivered AFTER the listener's own handler has run, because
+		 * that handler is what gives the peer its event handler and
+		 * its target queue -- configd's process_new_connection()
+		 * (third_party/configd/dnsinfo/dnsinfo_server.c) does exactly
+		 * that, and its comment says the request must run on
+		 * _dnsinfo_server_queue().
+		 *
+		 * Dispatching the two independently raced: a brand new peer
+		 * from xpc_connection_create(NULL, NULL) still has a NULL
+		 * xc_handler and dispatch_get_main_queue() as its target, so
+		 * whenever the main queue drained first the payload block
+		 * called a NULL Block -- a load of Block_layout.invoke at
+		 * offset 0x10 of NULL. That is the crash a real boot produced
+		 * the moment the first XPC request ever reached configd:
+		 * "pid 3 ... far 0x10 esr 0x92000005", backtrace
+		 * _dispatch_main_queue_callback_4CF -> _dispatch_main_queue_drain
+		 * -> _dispatch_client_callout -> _dispatch_call_block_and_release.
+		 *
+		 * Nesting the delivery inside the listener callout fixes both
+		 * halves at once: the handler is set by the time it runs, and
+		 * peer->xc_target_queue is read after the listener had its
+		 * chance to call xpc_connection_set_target_queue().
+		 */
+		dispatch_async(conn->xc_target_queue, ^{
+			conn->xc_handler(peer);
+
+			dispatch_async(peer->xc_target_queue, ^{
+				peer->xc_handler(result);
+				xpc_release(result);
+			});
 		});
 
 	} else {

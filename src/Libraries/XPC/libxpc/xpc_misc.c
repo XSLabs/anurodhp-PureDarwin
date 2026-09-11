@@ -281,22 +281,43 @@ xpc_pipe_routine_reply(xpc_object_t xobj)
 	message->id = xpc_dictionary_get_uint64(xobj, XPC_SEQID);
 	xpc_assert(message->id != 0, "'%s' key not found in reply", XPC_SEQID);
 
+	/*
+	 * DAR-284: both descriptors MUST be initialized BY FIELD NAME.
+	 * <mach/message.h> declares mach_msg_ool_descriptor_t and
+	 * mach_msg_ool_ports_descriptor_t with `size`/`count` placed BEFORE
+	 * the deallocate/copy/disposition/type bitfields on ILP32 and AFTER
+	 * them on LP64 (the `#if !defined(__LP64__)` split inside each
+	 * struct). The positional initializer this code used was written for
+	 * the 32-bit order, so on arm64 every field landed one slot early:
+	 * `size`/`count` was stored into `deallocate`, the real `copy` into
+	 * `disposition`, the real `disposition` into `type`, and the
+	 * descriptor TYPE tag into `count`. The kernel then parsed
+	 * descriptor 0 as a MACH_MSG_PORT_DESCRIPTOR and descriptor 1 with
+	 * an impossible disposition, and mach_msg_send() rejected the whole
+	 * message with MACH_SEND_INVALID_RIGHT (0x1000000a) -- measured on a
+	 * real QEMU boot, on every XPC message this target has ever sent.
+	 *
+	 * `count` is a NUMBER OF PORTS, not a byte length (osfmk/ipc/
+	 * ipc_kmsg.c reads `count` port names out of `address`); the old
+	 * `port_count * sizeof(mach_port_t)` was a second, independent bug
+	 * that only stayed invisible because the kernel had already rejected
+	 * the message for the first one.
+	 */
 	const mach_msg_ool_descriptor_t ool_data = {
-		packed, // address
-		size, // size
-		FALSE, // deal
-		MACH_MSG_VIRTUAL_COPY, // copy
-		0, // pad2
-		MACH_MSG_OOL_DESCRIPTOR // descriptor
+		.address	= packed,
+		.size		= (mach_msg_size_t)size,
+		.deallocate	= FALSE,
+		.copy		= MACH_MSG_VIRTUAL_COPY,
+		.type		= MACH_MSG_OOL_DESCRIPTOR,
 	};
 
 	const mach_msg_ool_ports_descriptor_t ool_ports = {
-		port_set.buffer,
-		port_set.port_count * sizeof(mach_port_t),
-		FALSE,
-		MACH_MSG_VIRTUAL_COPY,
-		MACH_MSG_TYPE_MAKE_SEND,
-		MACH_MSG_OOL_PORTS_DESCRIPTOR
+		.address	= port_set.buffer,
+		.count		= (mach_msg_size_t)port_set.port_count,
+		.deallocate	= FALSE,
+		.copy		= MACH_MSG_VIRTUAL_COPY,
+		.disposition	= MACH_MSG_TYPE_MAKE_SEND,
+		.type		= MACH_MSG_OOL_PORTS_DESCRIPTOR,
 	};
 
 	message->body.msgh_descriptor_count = 2;
@@ -341,9 +362,26 @@ xpc_pipe_send(xpc_object_t xobj, mach_port_t dst, mach_port_t local,
 			port_set.buffer = realloc(port_set.buffer, port_set.buffer_size * sizeof(mach_port_t));
 		}
 
-		kern_return_t kr = mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND);
-		xpc_assert(kr == KERN_SUCCESS, "mach_port_insert_right() failed");
-
+		/*
+		 * DAR-284: no mach_port_insert_right(MAKE_SEND) here, and the
+		 * descriptor below says COPY_SEND rather than MOVE_SEND.
+		 * MAKE_SEND manufactures a send right FROM A RECEIVE RIGHT, so
+		 * it only ever worked for a port this task owns the receive
+		 * side of. The port that actually travels in a reply is the
+		 * other end's port -- configd's
+		 * xpc_dictionary_create_reply() copies the client's XPC_RPORT
+		 * send right straight out of the request -- and on that,
+		 * mach_port_insert_right() fails and the old assert killed the
+		 * daemon outright ("Bug in libxpc: mach_port_insert_right()
+		 * failed", pid 3, measured on a real boot).
+		 *
+		 * COPY_SEND is the right disposition for both cases this port
+		 * really sees: a send right received from a peer, and an
+		 * endpoint naming a connection's own local port (which
+		 * xpc_connection_create() already gave a send right at
+		 * creation). It also leaves the sender's right intact, which
+		 * MOVE_SEND would not.
+		 */
 		port_set.buffer[port_index] = port;
 		return port_index;
 	});
@@ -369,22 +407,43 @@ xpc_pipe_send(xpc_object_t xobj, mach_port_t dst, mach_port_t local,
 	message->header.msgh_local_port = local;
 	message->id = id;
 
+	/*
+	 * DAR-284: both descriptors MUST be initialized BY FIELD NAME.
+	 * <mach/message.h> declares mach_msg_ool_descriptor_t and
+	 * mach_msg_ool_ports_descriptor_t with `size`/`count` placed BEFORE
+	 * the deallocate/copy/disposition/type bitfields on ILP32 and AFTER
+	 * them on LP64 (the `#if !defined(__LP64__)` split inside each
+	 * struct). The positional initializer this code used was written for
+	 * the 32-bit order, so on arm64 every field landed one slot early:
+	 * `size`/`count` was stored into `deallocate`, the real `copy` into
+	 * `disposition`, the real `disposition` into `type`, and the
+	 * descriptor TYPE tag into `count`. The kernel then parsed
+	 * descriptor 0 as a MACH_MSG_PORT_DESCRIPTOR and descriptor 1 with
+	 * an impossible disposition, and mach_msg_send() rejected the whole
+	 * message with MACH_SEND_INVALID_RIGHT (0x1000000a) -- measured on a
+	 * real QEMU boot, on every XPC message this target has ever sent.
+	 *
+	 * `count` is a NUMBER OF PORTS, not a byte length (osfmk/ipc/
+	 * ipc_kmsg.c reads `count` port names out of `address`); the old
+	 * `port_count * sizeof(mach_port_t)` was a second, independent bug
+	 * that only stayed invisible because the kernel had already rejected
+	 * the message for the first one.
+	 */
 	const mach_msg_ool_descriptor_t ool_data = {
-		packed, // address
-		size, // size
-		FALSE, // deallocate
-		MACH_MSG_VIRTUAL_COPY, // copy
-		0, // pad2
-		MACH_MSG_OOL_DESCRIPTOR // descriptor
+		.address	= packed,
+		.size		= (mach_msg_size_t)size,
+		.deallocate	= FALSE,
+		.copy		= MACH_MSG_VIRTUAL_COPY,
+		.type		= MACH_MSG_OOL_DESCRIPTOR,
 	};
 
 	const mach_msg_ool_ports_descriptor_t ool_ports = {
-		port_set.buffer,
-		port_set.port_count * sizeof(mach_port_t),
-		FALSE,
-		MACH_MSG_VIRTUAL_COPY,
-		MACH_MSG_TYPE_MOVE_SEND,
-		MACH_MSG_OOL_PORTS_DESCRIPTOR
+		.address	= port_set.buffer,
+		.count		= (mach_msg_size_t)port_set.port_count,
+		.deallocate	= FALSE,
+		.copy		= MACH_MSG_VIRTUAL_COPY,
+		.disposition	= MACH_MSG_TYPE_COPY_SEND,
+		.type		= MACH_MSG_OOL_PORTS_DESCRIPTOR,
 	};
 
 	message->body.msgh_descriptor_count = 2;
@@ -408,7 +467,7 @@ int
 xpc_pipe_receive(mach_port_t local, mach_port_t *remote, xpc_object_t *result,
     uint64_t *id)
 {
-	struct xpc_message message;
+	struct xpc_message *message;
 	mach_msg_header_t *request;
 	kern_return_t kr;
 	mach_msg_trailer_t *tr;
@@ -416,40 +475,80 @@ xpc_pipe_receive(mach_port_t local, mach_port_t *remote, xpc_object_t *result,
 	struct xpc_object *xo;
 	audit_token_t *auditp;
 	xpc_u val;
+	mach_msg_size_t receive_size;
 
-	request = &message.header;
-	request->msgh_size = sizeof(struct xpc_message);
+	/*
+	 * DAR-284: the receive buffer must hold the message AND the trailer
+	 * that MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT) asks for.
+	 * A bare `struct xpc_message` ends in an 8-byte mach_msg_trailer_t,
+	 * but the audit trailer requested here is sizeof(
+	 * mach_msg_audit_trailer_t) = 52 bytes, so every receive came back
+	 * MACH_RCV_TOO_LARGE -- and, with no MACH_RCV_LARGE, the kernel
+	 * DESTROYS the message rather than requeueing it. xpc_pipe_try_receive()
+	 * below already sizes its buffer exactly this way; this path never
+	 * got the same treatment because nothing on this target had ever
+	 * completed an XPC message exchange to exercise it.
+	 */
+	receive_size = sizeof(struct xpc_message) +
+	    sizeof(mach_msg_audit_trailer_t);
+	message = calloc(1, receive_size);
+	if (message == NULL)
+		return (ENOMEM);
+
+	request = &message->header;
+	request->msgh_size = receive_size;
 	request->msgh_local_port = local;
 	kr = mach_msg(request, MACH_RCV_MSG |
 	    MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
 	    MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT),
-	    0, request->msgh_size, request->msgh_local_port,
+	    0, receive_size, request->msgh_local_port,
 	    MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
 
-	if (kr != 0)
+	/*
+	 * DAR-284: and a failed receive must NOT fall through. Every line
+	 * below reads the message buffer the kernel just declined to fill;
+	 * the old code logged through debugf() (an os_log() that goes
+	 * nowhere here) and then unpacked whatever happened to be in that
+	 * memory, which surfaced as "nvlist buffer too small (length=1)"
+	 * on a real boot -- a garbage length, not a real short message.
+	 */
+	if (kr != KERN_SUCCESS) {
 		debugf("mach_msg_receive returned %d\n", kr);
+		free(message);
+		return (EINVAL);
+	}
 	*remote = request->msgh_remote_port;
-	*id = message.id;
-	data_size = message.ool_data.size;
+	*id = message->id;
+	data_size = message->ool_data.size;
 	debugf("unpacking data_size=%zu", data_size);
 
-	nvlist_t *nv = nvlist_unpack(&message.ool_data.address, data_size);
+	/*
+	 * DAR-284: the payload is the OOL region the kernel allocated, which
+	 * is what `address` POINTS TO -- `&...address` is the descriptor
+	 * field itself, so this unpacked 8 bytes of pointer value as if they
+	 * were an nvlist header.
+	 */
+	nvlist_t *nv = nvlist_unpack(message->ool_data.address, data_size);
 	xo = nv2xpc(nv, ^(int64_t port_index) {
-		xpc_assert(port_index <= message.ool_ports.count / sizeof(mach_port_t), "Port index greater than number of ports in buffer");
-		mach_port_t *ports = message.ool_ports.address;
+		/* DAR-284: ool_ports.count is the number of ports the kernel
+		 * delivered, not a byte length -- see the send-side comment
+		 * above. Dividing by sizeof(mach_port_t) here made the bound
+		 * 0 for any message carrying 1-3 ports. */
+		xpc_assert(port_index < message->ool_ports.count, "Port index greater than number of ports in buffer");
+		mach_port_t *ports = message->ool_ports.address;
 		return ports[port_index];
 	});
 	nvlist_destroy(nv);
 
-	mig_deallocate((vm_address_t)message.ool_data.address, message.ool_data.size);
-	message.ool_data.address = NULL;
-	message.ool_data.size = 0;
+	mig_deallocate((vm_address_t)message->ool_data.address, message->ool_data.size);
+	message->ool_data.address = NULL;
+	message->ool_data.size = 0;
 
-	mig_deallocate((vm_address_t)message.ool_ports.address, message.ool_ports.count * sizeof(mach_port_t));
-	message.ool_ports.address = NULL;
-	message.ool_ports.count = 0;
+	mig_deallocate((vm_address_t)message->ool_ports.address, message->ool_ports.count * sizeof(mach_port_t));
+	message->ool_ports.address = NULL;
+	message->ool_ports.count = 0;
 
-	tr = (mach_msg_trailer_t *)(((char *)&message) + request->msgh_size);
+	tr = (mach_msg_trailer_t *)(((char *)message) + request->msgh_size);
 	auditp = &((mach_msg_audit_trailer_t *)tr)->msgh_audit;
 
 	xo->xo_audit_token = malloc(sizeof(*auditp));
@@ -466,13 +565,14 @@ xpc_pipe_receive(mach_port_t local, mach_port_t *remote, xpc_object_t *result,
 		xpc_release(xotmp);
 	}
 	{
-		xpc_object_t xotmp = xpc_uint64_create(message.id);
+		xpc_object_t xotmp = xpc_uint64_create(message->id);
 		xpc_dictionary_set_value_nokeycheck(xo, XPC_SEQID, xotmp);
 		xpc_release(xotmp);
 	}
 
 	xo->xo_flags |= _XPC_FROM_WIRE;
 	*result = xo;
+	free(message);
 	return (0);
 }
 
@@ -553,9 +653,16 @@ xpc_pipe_try_receive(mach_port_t portset, xpc_object_t *requestobj, mach_port_t 
 	data_size = message->ool_data.size;
 	debugf("unpacking data_size=%d", data_size);
 
-	nvlist_t *nvlist = nvlist_unpack(&message->ool_data.address, data_size);
+	/*
+	 * DAR-284: the payload is the OOL region the kernel allocated, which
+	 * is what `address` POINTS TO -- `&...address` is the descriptor
+	 * field itself, so this unpacked 8 bytes of pointer value as if they
+	 * were an nvlist header.
+	 */
+	nvlist_t *nvlist = nvlist_unpack(message->ool_data.address, data_size);
 	xo = nv2xpc(nvlist, ^(int64_t port_index) {
-		xpc_assert(port_index <= message->ool_ports.count / sizeof(mach_port_t), "Port index greater than number of ports in buffer");
+		/* DAR-284: a port count, not a byte length -- see xpc_pipe_send(). */
+		xpc_assert(port_index < message->ool_ports.count, "Port index greater than number of ports in buffer");
 		mach_port_t *ports = message->ool_ports.address;
 		return ports[port_index];
 	});

@@ -17,8 +17,15 @@ void xpc_api_misuse(const char *info, ...) {
 
 	int fd = open("/dev/console", O_WRONLY | O_NOCTTY);
 	if (fd >= 0) {
-		const char prefix[] = "PureDarwin libxpc misuse: ";
-		write(fd, prefix, sizeof(prefix) - 1);
+		/* DAR-284: the pid matters -- this line is the only trace an
+		 * aborting XPC process leaves on the console, and a client and
+		 * its server both reach it through the same libxpc. */
+		char prefix[64];
+		int n = snprintf(prefix, sizeof(prefix),
+		    "PureDarwin libxpc misuse (pid %d): ", getpid());
+		if (n > 0) {
+			write(fd, prefix, (size_t)n < sizeof(prefix) ? (size_t)n : sizeof(prefix) - 1);
+		}
 		if (xpc_api_misuse_reason) {
 			write(fd, xpc_api_misuse_reason, strlen(xpc_api_misuse_reason));
 		}

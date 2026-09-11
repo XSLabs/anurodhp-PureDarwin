@@ -172,10 +172,16 @@ __private_extern__ int xpc_pipe_receive(mach_port_t local, mach_port_t *remote,
 __private_extern__ void xpc_dictionary_set_value_nokeycheck(xpc_object_t xdict, const char *key, xpc_object_t value);
 __private_extern__ void xpc_api_misuse(const char *info, ...) __attribute__((noreturn, format(printf, 1, 2)));
 
+/*
+ * DAR-284: these carry __FILE__/__LINE__ because the bare message alone is
+ * not enough to find the call site -- "xpc_object_t not of dictionary type"
+ * is emitted verbatim from two different functions in xpc_misc.c, and a
+ * real boot hit one of them with no way to tell which.
+ */
 #define xpc_precondition(cond, message, ...) \
-	do { if (!(cond)) xpc_api_misuse("Bug in client of libxpc: " message, ##__VA_ARGS__); } while (0)
+	do { if (!(cond)) xpc_api_misuse("%s:%d: Bug in client of libxpc: " message, __FILE__, __LINE__, ##__VA_ARGS__); } while (0)
 #define xpc_assert(cond, message, ...) \
-	do { if (!(cond)) xpc_api_misuse("Bug in libxpc: " message, ##__VA_ARGS__); } while (0)
+	do { if (!(cond)) xpc_api_misuse("%s:%d: Bug in libxpc: " message, __FILE__, __LINE__, ##__VA_ARGS__); } while (0)
 
 #define xpc_assert_nonnull(xo) \
 	xpc_precondition(xo != NULL, "Parameter cannot be NULL")
