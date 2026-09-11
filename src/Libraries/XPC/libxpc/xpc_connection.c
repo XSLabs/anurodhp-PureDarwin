@@ -308,9 +308,28 @@ xpc_connection_send_message_with_reply_sync(xpc_connection_t conn,
 	__block xpc_object_t result;
 	dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 
+	/*
+	 * DAR-284: the reply must be RETAINED here. The delivery block in
+	 * xpc_connection_recv_message() releases the message as soon as the
+	 * handler returns, so storing the bare pointer handed this caller a
+	 * freed object the instant the semaphore was signalled. That is a
+	 * use-after-free whose symptom reads like a protocol bug rather than
+	 * a memory bug: the dictionary still answered
+	 * xpc_dictionary_get_count() == 3 (xpc_dictionary_destroy() empties
+	 * the pair list but never clears xo_size) while every single
+	 * xpc_dictionary_get_value() returned NULL, so configd's 380-byte
+	 * DNS configuration "arrived" in a reply that looked simultaneously
+	 * populated and empty. Measured on a real boot.
+	 *
+	 * Retaining inside the handler, before the signal, also closes the
+	 * race with the waiting thread. Real XPC returns this object at +1
+	 * and real callers release it -- dnsinfo_copy.c's
+	 * dns_configuration_copy() does exactly that -- so the reference
+	 * taken here is the one the caller gives back.
+	 */
 	xpc_connection_send_message_with_reply(conn, message, NULL,
 	    ^(xpc_object_t o) {
-		result = o;
+		result = xpc_retain(o);
 		dispatch_semaphore_signal(sem);
 	});
 

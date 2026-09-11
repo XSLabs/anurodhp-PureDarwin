@@ -82,6 +82,13 @@ xpc_dictionary_destroy(struct xpc_object *dict)
 		free((void *)p->key);
 		free(p);
 	}
+
+	/*
+	 * DAR-284: keep the count honest. Leaving xo_size behind made a
+	 * use-after-free on a dictionary look like a populated object with
+	 * no entries -- get_count() said 3, every get_value() said NULL.
+	 */
+	dict->xo_size = 0;
 }
 
 static void
