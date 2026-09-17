@@ -1,8 +1,10 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "launch.h"
 #include "launch_priv.h"
@@ -80,10 +82,89 @@ pd_launchd_boot_remount_root_rw(void)
 	}
 }
 
+/* iokit project, DAR-135 follow-up (2026-09-17): tools/init_binary/
+ * inject_into_sd_image.sh populates /Library/LaunchDaemons (and everything
+ * else on the image) via a plain, non-privileged host-side `cp` into an
+ * hdiutil-attached HFS+ volume -- deliberately, so the whole
+ * userland-staging build+inject+boot pipeline never needs an interactive
+ * sudo password (see that script's own "no sudo needed for an
+ * hdiutil-attached image owned by this user" comment). The real on-disk
+ * owner of every file it writes is therefore whatever uid ran the script
+ * on the host, not root -- confirmed 2026-09-17 by mounting a real image
+ * and running `ls -ln`: /Library/LaunchDaemons/*.plist all showed uid 502
+ * (the host build user), not 0.
+ *
+ * This is invisible to launchd's own pd_launchd_load_daemons_dir() (it
+ * reads plists directly with no ownership gate, so boot-time static
+ * loading already worked), but it is a real, reproduced blocker for the
+ * DYNAMIC `launchctl load|unload <plist>` path: launchctl.c's own real,
+ * unmodified path_goodness_check() -- `sb.st_uid != 0 && sb.st_uid !=
+ * getuid()` -- rejects every one of these files with "Dubious ownership
+ * on file (skipping)" when run as root, seen live in
+ * qemu/dar253_boot3.log, qemu/dar253_boot5.log and
+ * qemu/dar170_crash_probe.log ("launchctl unload
+ * /Library/LaunchDaemons/com.apple.configd.plist" -> "nothing found to
+ * unload"). That check is real Apple security policy and correct; the bug
+ * is upstream of it, in how this port's own tooling populates the image.
+ *
+ * Real macOS never hits this because its install tooling runs privileged
+ * and lays down system files already owned by root:wheel. This process
+ * IS root by the time it reaches here (PID 1, and pd_launchd_boot_
+ * remount_root_rw() has just made "/" writable), so it can fix the real
+ * on-disk ownership itself with no host-side sudo involved -- that keeps
+ * inject_into_sd_image.sh's no-sudo design intact while making the
+ * on-disk state match what real Apple's packaging actually produces,
+ * rather than changing launchctl.c's real, correct check. */
+static void
+pd_launchd_boot_chown_root(const char *path)
+{
+	if (chown(path, 0, 0) < 0 && errno != ENOENT) {
+		launchd_syslog(LOG_ERR | LOG_CONSOLE,
+				"pd_launchd_boot: chown(%s, root:wheel) failed: %s",
+				path, strerror(errno));
+	}
+}
+
+static void
+pd_launchd_boot_fix_launchdaemons_ownership(void)
+{
+	static const char dir[] = "/Library/LaunchDaemons";
+	DIR *d;
+	struct dirent *de;
+	unsigned int fixed = 0;
+
+	pd_launchd_boot_chown_root("/Library");
+	pd_launchd_boot_chown_root(dir);
+
+	d = opendir(dir);
+	if (d == NULL) {
+		/* Not fatal -- e.g. a minimal image with no LaunchDaemons dir
+		 * at all yet. pd_launchd_load_daemons_dir() below handles
+		 * that case the same way. */
+		return;
+	}
+	while ((de = readdir(d)) != NULL) {
+		char path[1024];
+		if (de->d_name[0] == '.') {
+			continue;
+		}
+		snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+		pd_launchd_boot_chown_root(path);
+		fixed++;
+	}
+	closedir(d);
+
+	launchd_syslog(LOG_NOTICE | LOG_CONSOLE,
+			"pd_launchd_boot: normalized %s + %u plist(s) to root:wheel "
+			"(DAR-135, dynamic launchctl load/unload ownership check)",
+			dir, fixed);
+}
+
 void
 pd_launchd_boot(void)
 {
 	pd_launchd_boot_remount_root_rw();
+	pd_launchd_boot_fix_launchdaemons_ownership();
 	pd_launchd_boot_mkdir_p("/dev", 0755);
 	pd_launchd_boot_try_mount("devfs", "/dev", 0, NULL);
 }
