@@ -2,6 +2,7 @@
 #include <sys/mount.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -200,12 +201,113 @@ pd_launchd_boot_fix_privsep_dir(void)
 			"(DAR-183, sshd privilege-separation chroot dir)", dir);
 }
 
+/* /tmp and /var/run are emptied at boot, and /tmp and /var/tmp are made
+ * root:wheel 01777 (DAR-411). Before this, /tmp kept its contents across
+ * boots, so a stale /tmp/.X0-lock from a crashed or killed X server made
+ * the next Xorg refuse to start ("Server is already active").
+ *
+ * On Apple, launchctl's system_specific_bootstrap() empties /var/run and
+ * /tmp (launchctl/launchctl.c:2416-2417, empty_dir() at :4440) and then
+ * recreates utmpx (:2425), all before its `load -D all` starts any
+ * daemon. launchd's core.c does run /bin/launchctl here too, but the image
+ * installs launchctl only at /usr/bin, so that call fails with ENOENT
+ * (inject_into_sd_image.sh). And this port's launchd loads
+ * /Library/LaunchDaemons itself (launchd.c, pd_launchd_load_daemons_dir),
+ * which creates sockets such as /var/run/syslog before launchctl would
+ * run. Enabling the real bootstrapper as-is would therefore delete live
+ * sockets; see DAR-420. So the emptying is done here instead: it runs
+ * before jobmgr_init() and before any job is imported, the same point
+ * relative to daemon start-up as on Apple.
+ *
+ * The walk follows empty_dir(): lstat() only, so symlinks are removed
+ * and never followed, depth first. It deviates in two ways:
+ * - Entries on another device are skipped, not force-unmounted, since
+ *   nothing is mounted under these paths on this image.
+ * - There is no lchflags(0) call, since lchflags is not exported here
+ *   and nothing on the image carries file flags.
+ *
+ * The mode fix is needed because the host-side image tooling cannot chown
+ * (as for the fixes above): these directories arrived owned by the host
+ * build uid, and /tmp was drw-r--r--, so non-root processes could not
+ * create files there. Apple's counterpart is launchctl's
+ * fix_bogus_file_metadata() (launchctl.c:4336-4337), but that exists only
+ * on macOS (#if !TARGET_OS_EMBEDDED, :4326), and the embedded build used
+ * here never runs it. */
+static void
+pd_launchd_boot_empty_dir(const char *dir, dev_t dev)
+{
+	DIR *d;
+	struct dirent *de;
+
+	d = opendir(dir);
+	if (d == NULL) {
+		return;
+	}
+	while ((de = readdir(d)) != NULL) {
+		char path[1024];
+		struct stat sb;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+			continue;
+		}
+		snprintf(path, sizeof(path), "%s/%s", dir, de->d_name);
+		if (lstat(path, &sb) < 0 || sb.st_dev != dev) {
+			continue;
+		}
+		if (S_ISDIR(sb.st_mode)) {
+			pd_launchd_boot_empty_dir(path, dev);
+			if (rmdir(path) < 0) {
+				launchd_syslog(LOG_ERR | LOG_CONSOLE,
+						"pd_launchd_boot: rmdir(%s) failed: %s", path, strerror(errno));
+			}
+		} else if (unlink(path) < 0) {
+			launchd_syslog(LOG_ERR | LOG_CONSOLE,
+					"pd_launchd_boot: unlink(%s) failed: %s", path, strerror(errno));
+		}
+	}
+	closedir(d);
+}
+
+static void
+pd_launchd_boot_clean_tmp_dirs(void)
+{
+	static const char *const emptied[] = { "/var/run", "/tmp" };
+	static const char *const sticky[] = { "/tmp", "/var/tmp" };
+	unsigned int i;
+	int fd;
+
+	for (i = 0; i < sizeof(emptied) / sizeof(emptied[0]); i++) {
+		struct stat sb;
+		if (lstat(emptied[i], &sb) == 0 && S_ISDIR(sb.st_mode)) {
+			pd_launchd_boot_empty_dir(emptied[i], sb.st_dev);
+		}
+	}
+	for (i = 0; i < sizeof(sticky) / sizeof(sticky[0]); i++) {
+		pd_launchd_boot_mkdir_p(sticky[i], 01777);
+		pd_launchd_boot_chown_root(sticky[i]);
+		if (chmod(sticky[i], 01777) < 0) {
+			launchd_syslog(LOG_ERR | LOG_CONSOLE,
+					"pd_launchd_boot: chmod(%s, 01777) failed: %s",
+					sticky[i], strerror(errno));
+		}
+	}
+	/* touch_file(_PATH_UTMPX, DEFFILEMODE), launchctl.c:2425. */
+	fd = open("/var/run/utmpx", O_WRONLY | O_CREAT, 0644);
+	if (fd >= 0) {
+		close(fd);
+	}
+	launchd_syslog(LOG_NOTICE | LOG_CONSOLE,
+			"pd_launchd_boot: emptied /var/run and /tmp; /tmp and /var/tmp "
+			"are root:wheel 01777 (DAR-411)");
+}
+
 void
 pd_launchd_boot(void)
 {
 	pd_launchd_boot_remount_root_rw();
 	pd_launchd_boot_fix_launchdaemons_ownership();
 	pd_launchd_boot_fix_privsep_dir();
+	pd_launchd_boot_clean_tmp_dirs();
 	pd_launchd_boot_mkdir_p("/dev", 0755);
 	pd_launchd_boot_try_mount("devfs", "/dev", 0, NULL);
 }
