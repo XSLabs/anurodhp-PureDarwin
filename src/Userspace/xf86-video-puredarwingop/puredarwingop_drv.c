@@ -445,7 +445,24 @@ PDGOPScreenInit(ScreenPtr pScreen, int argc, char **argv)
                (unsigned long long)p->fb.size, pScrn->virtualX, pScrn->virtualY,
                pScrn->displayWidth, pScrn->bitsPerPixel);
 
-    if (!p->fbOpen || p->fb.address == 0) {
+    /*
+     * PreInit opens the framebuffer once per server run, but CloseScreen
+     * closes it at the end of every server generation (so the kernel
+     * console gets the display back between generations). When the last
+     * client disconnects the server regenerates and calls ScreenInit again
+     * without PreInit, so reopen here if a previous CloseScreen closed it.
+     */
+    if (!p->fbOpen) {
+        kern_return_t kr = PDGOPOpen(&p->fb);
+        if (kr != KERN_SUCCESS) {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "ScreenInit: PDGOPOpen failed at %s: 0x%x\n",
+                       PDGOPLastErrorStage(), kr);
+            return FALSE;
+        }
+        p->fbOpen = TRUE;
+    }
+    if (p->fb.address == 0) {
         return FALSE;
     }
 
