@@ -19,10 +19,12 @@
  * blocks in mach_msg() on that set and writes a byte to a pipe for each
  * notification; the pipe's read end is the device's fd, so Xorg's main loop
  * wakes only when an event arrives. (A kqueue with EVFILT_MACHPORT on the
- * set was tried first: Xorg's ospoll uses poll(), which on this port
- * reported the kqueue fd readable continuously while kevent() returned
- * nothing, and the server spun at ~15-30% CPU. A pipe is an ordinary
- * pollable fd.) The thread stops on a message to a control port in the
+ * set was tried first: Xorg's ospoll uses poll(), which reported the
+ * kqueue fd readable continuously while kevent() returned nothing, and the
+ * server spun at ~15-30% CPU. That is xnu's own behaviour: a port-set
+ * knote is stay-active, and poll()/select() on the kqueue fd see it as
+ * pending (DAR-417, tools/userland_staging/kqueue_poll_smoketest.c). A
+ * pipe is an ordinary pollable fd.) The thread stops on a message to a control port in the
  * same set, never by destroying the set under a blocked receive, whose
  * name could be reused before the thread's next mach_msg(). The thread is
  * detached and signals a Mach semaphore as its last access to the driver's
