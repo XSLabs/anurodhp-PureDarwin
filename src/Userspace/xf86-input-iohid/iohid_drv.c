@@ -63,9 +63,17 @@
  * Keyboard LEDs. X's KeybdCtrl.leds (bit 0 Caps, 1 Num, 2 Scroll) is written
  * to each keyboard service with kIOHIDEventServiceUserClientSetElementValue
  * (selector 3: usage page, usage, value; IOHIDEventServiceUserClient.cpp:67,
- * 501-505, which needs the client open), page 8 (LEDs) usages 1-3
- * (IOHIDUsageTables.h:511-513). The last mask is also applied to a keyboard
- * plugged in later.
+ * 501-505, which needs the client open), page 8 (kHIDPage_LEDs,
+ * xnu-7195/iokit/IOKit/hidsystem/IOHIDUsageTables.h:44), usages Num Lock 1,
+ * Caps Lock 2, Scroll Lock 3 (USB HID Usage Tables, LED page; the two the
+ * kernel writes are IOHIDKeyboard.cpp:295-302, i + kHIDUsage_LED_NumLock).
+ * The last mask is also applied to a keyboard plugged in later.
+ *
+ * Threads. read_input runs on Xorg's input thread (InputThreadRegisterDev,
+ * hw/xfree86/common/xf86Events.c:246), which is where a plug or unplug opens
+ * or closes a service and shifts svc[]; the keyboard control procedure runs
+ * on the main thread. svcLock covers svc[], nsvc and the LED mask against
+ * that, and is held across the IOKit calls the scans make.
  *
  * Console. While the keyboard is enabled the driver holds IOHIDSystem's
  * server connection (type kIOHIDServerConnectType, entitlement
@@ -162,6 +170,7 @@ typedef struct {
     io_iterator_t  termIter;       /* kIOTerminatedNotification */
     int            leds;           /* keyboard: X's last LED mask */
     Bool           ledsValid;
+    pthread_mutex_t svcLock;       /* svc[], nsvc, leds: see IOHIDReadInput */
     uint8_t       *buf;
     unsigned long  nRecords;       /* HID event records decoded, for the close log */
 } IOHIDPrivRec, *IOHIDPrivPtr;
@@ -442,10 +451,12 @@ IOHIDScanMatched(InputInfoPtr pInfo)
 
     if (!priv->matchIter)
         return;
+    pthread_mutex_lock(&priv->svcLock);
     while ((s = IOIteratorNext(priv->matchIter)) != IO_OBJECT_NULL) {
         IOHIDOpenService(pInfo, s);
         IOObjectRelease(s);
     }
+    pthread_mutex_unlock(&priv->svcLock);
 }
 
 /* Drain the terminated iterator: close the state of each service that went. */
@@ -457,6 +468,7 @@ IOHIDScanTerminated(InputInfoPtr pInfo)
 
     if (!priv->termIter)
         return;
+    pthread_mutex_lock(&priv->svcLock);
     while ((s = IOIteratorNext(priv->termIter)) != IO_OBJECT_NULL) {
         uint64_t id = 0;
         if (IORegistryEntryGetRegistryEntryID(s, &id) == KERN_SUCCESS) {
@@ -473,6 +485,7 @@ IOHIDScanTerminated(InputInfoPtr pInfo)
         }
         IOObjectRelease(s);
     }
+    pthread_mutex_unlock(&priv->svcLock);
 }
 
 static void
@@ -670,10 +683,12 @@ IOHIDKbdCtrl(DeviceIntPtr dev, KeybdCtrl *ctrl)
 
     if (!priv || priv->kind != IOHID_KEYBOARD)
         return;
+    pthread_mutex_lock(&priv->svcLock);
     priv->leds = ctrl->leds;
     priv->ledsValid = TRUE;
     for (int i = 0; i < priv->nsvc; i++)
         IOHIDSetLEDs(&priv->svc[i], priv->leds);
+    pthread_mutex_unlock(&priv->svcLock);
 }
 
 static int
@@ -768,6 +783,7 @@ IOHIDPreInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags)
         return BadAlloc;
     }
     priv->pipeFd[0] = priv->pipeFd[1] = -1;
+    pthread_mutex_init(&priv->svcLock, NULL);
     pInfo->private = priv;
 
     type = xf86SetStrOption(pInfo->options, "Type", "pointer");
@@ -794,6 +810,7 @@ IOHIDUnInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags)
     (void)drv;
     if (priv) {
         IOHIDCloseServices(priv);
+        pthread_mutex_destroy(&priv->svcLock);
         free(priv->buf);
         free(priv);
         pInfo->private = NULL;
