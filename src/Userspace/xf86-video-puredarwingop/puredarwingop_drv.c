@@ -25,6 +25,7 @@
 #include "xf86cmap.h"
 
 #include <PDGOP.h>
+#include <pthread/qos.h>
 
 #define PDGOP_NAME        "puredarwingop"
 #define PDGOP_DRIVER_NAME "puredarwingop"
@@ -145,6 +146,16 @@ PDGOPSetup(void *module, void *opts, int *errmaj, int *errmin)
     (void)errmin;
     if (!initialized) {
         initialized = TRUE;
+        /* DAR-439: module setup runs on Xorg's main thread, the one thread
+         * that dispatches requests and draws, so raise it to USER_INTERACTIVE
+         * here (Window Maker does the same in its main()). Under the launchd
+         * session job (ProcessType=Interactive, a DAEMON_INTERACTIVE task)
+         * XNU squashes that to USER_INITIATED, base priority 31 -> 37
+         * (osfmk/kern/task_policy.c:866-868 and thread_policy.c:1554-1556 in
+         * xnu-7195). Raising only one of Xorg and the window manager
+         * measured worse than neither. Threads created later inherit it. The
+         * return value is ignored: on failure the priority stays as it was. */
+        (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
         /* Flags 0, NOT HaveDriverFuncs: that flag promises DriverRec.driverFunc
          * is valid, and this driver does not implement one (it is busless - no
          * GET_REQUIRED_HW_INTERFACES etc). Claiming it left Xorg calling through
