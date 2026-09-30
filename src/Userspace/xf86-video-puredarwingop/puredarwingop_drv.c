@@ -155,7 +155,15 @@ PDGOPSetup(void *module, void *opts, int *errmaj, int *errmin)
          * xnu-7195). Raising only one of Xorg and the window manager
          * measured worse than neither. Threads created later inherit it. The
          * return value is ignored: on failure the priority stays as it was. */
-        (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        {
+            int qrc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+            qos_class_t qc = QOS_CLASS_UNSPECIFIED;
+            int qrel = 0;
+
+            (void)pthread_get_qos_class_np(pthread_self(), &qc, &qrel);
+            xf86Msg(X_INFO, "puredarwingop: main thread QoS set: rc=%d, class now 0x%x\n",
+                qrc, (unsigned)qc);
+        }
         /* Flags 0, NOT HaveDriverFuncs: that flag promises DriverRec.driverFunc
          * is valid, and this driver does not implement one (it is busless - no
          * GET_REQUIRED_HW_INTERFACES etc). Claiming it left Xorg calling through
