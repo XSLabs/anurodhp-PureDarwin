@@ -47,8 +47,33 @@
  * mice do not share a button mask. Absolute pointer events
  * (kIOHIDEventOptionIsAbsolute, IOHIDEventTypes.h:604) are ignored.
  *
- * Not yet: hot-plug (services are enumerated at DEVICE_ON only) and the
- * keyboard LEDs (DAR-418).
+ * Hot-plug (DAR-418). Services are found through
+ * IOServiceAddMatchingNotification(kIOFirstMatchNotification and
+ * kIOTerminatedNotification, "IOHIDEventService"), not a one-shot scan. The
+ * notification port is a member of the same port set, so the helper thread
+ * wakes read_input on a plug or unplug as it does on an event, and
+ * read_input drains both iterators (which is also what re-arms them: an
+ * IOServiceUserNotification sends only while armed, and it is armed by
+ * draining its iterator). The helper thread only receives, and discards the
+ * (oversized) notification message, so the callbacks are never dispatched.
+ * A device with no service yet is not an error: DEVICE_ON succeeds and the
+ * device picks services up as they appear. Each service is identified by its
+ * registry entry ID, so a termination closes exactly that service's state.
+ *
+ * Keyboard LEDs. X's KeybdCtrl.leds (bit 0 Caps, 1 Num, 2 Scroll) is written
+ * to each keyboard service with kIOHIDEventServiceUserClientSetElementValue
+ * (selector 3: usage page, usage, value; IOHIDEventServiceUserClient.cpp:67,
+ * 501-505, which needs the client open), page 8 (kHIDPage_LEDs,
+ * xnu-7195/iokit/IOKit/hidsystem/IOHIDUsageTables.h:44), usages Num Lock 1,
+ * Caps Lock 2, Scroll Lock 3 (USB HID Usage Tables, LED page; the two the
+ * kernel writes are IOHIDKeyboard.cpp:295-302, i + kHIDUsage_LED_NumLock).
+ * The last mask is also applied to a keyboard plugged in later.
+ *
+ * Threads. read_input runs on Xorg's input thread (InputThreadRegisterDev,
+ * hw/xfree86/common/xf86Events.c:246), which is where a plug or unplug opens
+ * or closes a service and shifts svc[]; the keyboard control procedure runs
+ * on the main thread. svcLock covers svc[], nsvc and the LED mask against
+ * that, and is held across the IOKit calls the scans make.
  *
  * Console. While the keyboard is enabled the driver holds IOHIDSystem's
  * server connection (type kIOHIDServerConnectType, entitlement
@@ -91,6 +116,8 @@
 
 #define kIOHIDEventServiceUserClientType 'esuc'
 #define kIOHIDEventServiceUserClientOpen 0
+#define kIOHIDEventServiceUserClientSetElementValue 3
+#define kHIDPageLEDs                     8
 #define kIOHIDServerConnectType          0
 #define kIOHIDCreateSharedMemorySelector 0
 #define kIOHIDCurrentShmemVersion        4
@@ -121,6 +148,7 @@ typedef struct {
     io_connect_t       connect;
     IODataQueueMemory *queue;
     mach_port_t        port;
+    uint64_t           entryID;        /* registry entry ID of the IOHIDEventService */
     uint32_t           buttons;        /* pointer: last button mask */
     int32_t            fracX, fracY;   /* pointer: IOFixed remainders */
     int32_t            fracSX, fracSY; /* scroll: IOFixed remainders */
@@ -137,6 +165,12 @@ typedef struct {
     volatile int   stopping;
     int            pipeFd[2];      /* thread -> read_input; [0] is pInfo->fd */
     io_connect_t   hidSystem;      /* keyboard only: console handoff */
+    IONotificationPortRef notifyPort; /* hot-plug; its port is in portSet */
+    io_iterator_t  matchIter;      /* kIOFirstMatchNotification */
+    io_iterator_t  termIter;       /* kIOTerminatedNotification */
+    int            leds;           /* keyboard: X's last LED mask */
+    Bool           ledsValid;
+    pthread_mutex_t svcLock;       /* svc[], nsvc, leds: see IOHIDReadInput */
     uint8_t       *buf;
     unsigned long  nRecords;       /* HID event records decoded, for the close log */
 } IOHIDPrivRec, *IOHIDPrivPtr;
@@ -325,6 +359,175 @@ IOHIDNotifyThread(void *arg)
 }
 
 static void
+IOHIDSetLEDs(IOHIDService *e, int leds)
+{
+    /* X LED bit n -> HID LED usage: 0 Caps (2), 1 Num (1), 2 Scroll (3). */
+    static const uint64_t usage[3] = { 2, 1, 3 };
+
+    for (int bit = 0; bit < 3; bit++) {
+        uint64_t in[3] = { kHIDPageLEDs, usage[bit], (leds >> bit) & 1 };
+        /* Best effort: a keyboard without that LED refuses, which is fine. */
+        (void)IOConnectCallScalarMethod(e->connect, kIOHIDEventServiceUserClientSetElementValue,
+                                        in, 3, NULL, NULL);
+    }
+}
+
+static void
+IOHIDCloseService(IOHIDService *e)
+{
+    if (e->queue)
+        IOConnectUnmapMemory64(e->connect, 0, mach_task_self(), (mach_vm_address_t)(uintptr_t)e->queue);
+    if (e->connect)
+        IOServiceClose(e->connect);
+    if (e->port)
+        mach_port_mod_refs(mach_task_self(), e->port, MACH_PORT_RIGHT_RECEIVE, -1);
+    memset(e, 0, sizeof(*e));
+}
+
+/* Open one wanted service into the next free slot. */
+static void
+IOHIDOpenService(InputInfoPtr pInfo, io_service_t s)
+{
+    IOHIDPrivPtr priv = pInfo->private;
+    int page = IOHIDIntProp(s, "PrimaryUsagePage"), usage = IOHIDIntProp(s, "PrimaryUsage");
+    uint64_t id = 0;
+    IOHIDService *e;
+    mach_vm_address_t addr = 0;
+    mach_vm_size_t size = 0;
+    uint64_t options = 0;
+    kern_return_t kr;
+
+    if (!IOHIDWantService(priv->kind, page, usage))
+        return;
+    if (priv->nsvc >= IOHID_MAX_SERVICES) {
+        xf86IDrvMsg(pInfo, X_WARNING, "more than %d IOHIDEventServices; ignoring one\n",
+                    IOHID_MAX_SERVICES);
+        return;
+    }
+    if (IORegistryEntryGetRegistryEntryID(s, &id) != KERN_SUCCESS)
+        id = 0;
+    for (int i = 0; id && i < priv->nsvc; i++)
+        if (priv->svc[i].entryID == id)
+            return;                     /* already open */
+
+    e = &priv->svc[priv->nsvc];
+    /* Fresh state: a button held across DEVICE_OFF was released
+     * by X, so a stale mask would swallow the next press. */
+    memset(e, 0, sizeof(*e));
+    e->entryID = id;
+    kr = IOServiceOpen(s, mach_task_self(), kIOHIDEventServiceUserClientType, &e->connect);
+    if (!kr)
+        kr = IOConnectCallScalarMethod(e->connect, kIOHIDEventServiceUserClientOpen, &options, 1, NULL, NULL);
+    if (!kr)
+        kr = IOConnectMapMemory64(e->connect, 0, mach_task_self(), &addr, &size, kIOMapAnywhere);
+    if (!kr) {
+        e->port = IODataQueueAllocateNotificationPort();
+        kr = e->port ? IOConnectSetNotificationPort(e->connect, 0, e->port, 0) : KERN_FAILURE;
+    }
+    if (!kr)
+        kr = mach_port_insert_member(mach_task_self(), e->port, priv->portSet);
+    if (kr) {
+        xf86IDrvMsg(pInfo, X_WARNING, "IOHIDEventService (usage %d:%d): open failed 0x%x\n",
+                    page, usage, kr);
+        if (addr)
+            IOConnectUnmapMemory64(e->connect, 0, mach_task_self(), addr);
+        e->queue = NULL;
+        IOHIDCloseService(e);
+        return;
+    }
+    e->queue = (IODataQueueMemory *)(uintptr_t)addr;
+    xf86IDrvMsg(pInfo, X_INFO, "IOHIDEventService (usage %d:%d) opened\n", page, usage);
+    priv->nsvc++;
+    if (priv->kind == IOHID_KEYBOARD && priv->ledsValid)
+        IOHIDSetLEDs(e, priv->leds);
+}
+
+/* Drain the first-match iterator (which re-arms it): open what it returns. */
+static void
+IOHIDScanMatched(InputInfoPtr pInfo)
+{
+    IOHIDPrivPtr priv = pInfo->private;
+    io_service_t s;
+
+    if (!priv->matchIter)
+        return;
+    pthread_mutex_lock(&priv->svcLock);
+    while ((s = IOIteratorNext(priv->matchIter)) != IO_OBJECT_NULL) {
+        IOHIDOpenService(pInfo, s);
+        IOObjectRelease(s);
+    }
+    pthread_mutex_unlock(&priv->svcLock);
+}
+
+/* Drain the terminated iterator: close the state of each service that went. */
+static void
+IOHIDScanTerminated(InputInfoPtr pInfo)
+{
+    IOHIDPrivPtr priv = pInfo->private;
+    io_service_t s;
+
+    if (!priv->termIter)
+        return;
+    pthread_mutex_lock(&priv->svcLock);
+    while ((s = IOIteratorNext(priv->termIter)) != IO_OBJECT_NULL) {
+        uint64_t id = 0;
+        if (IORegistryEntryGetRegistryEntryID(s, &id) == KERN_SUCCESS) {
+            for (int i = 0; i < priv->nsvc; i++) {
+                if (priv->svc[i].entryID != id)
+                    continue;
+                xf86IDrvMsg(pInfo, X_INFO, "IOHIDEventService removed\n");
+                IOHIDCloseService(&priv->svc[i]);
+                for (int j = i + 1; j < priv->nsvc; j++)
+                    priv->svc[j - 1] = priv->svc[j];
+                memset(&priv->svc[--priv->nsvc], 0, sizeof(IOHIDService));
+                break;
+            }
+        }
+        IOObjectRelease(s);
+    }
+    pthread_mutex_unlock(&priv->svcLock);
+}
+
+static void
+IOHIDNotifyNoop(void *refcon, io_iterator_t iterator)
+{
+    (void)refcon;
+    (void)iterator;
+}
+
+/* Returns 0 on failure. Finding no service yet is success. */
+static int
+IOHIDOpenServices(InputInfoPtr pInfo)
+{
+    IOHIDPrivPtr priv = pInfo->private;
+    mach_port_t np;
+
+    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &priv->portSet) != KERN_SUCCESS)
+        return 0;
+    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &priv->ctlPort) != KERN_SUCCESS ||
+        mach_port_insert_right(mach_task_self(), priv->ctlPort, priv->ctlPort, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS ||
+        mach_port_insert_member(mach_task_self(), priv->ctlPort, priv->portSet) != KERN_SUCCESS)
+        return 0;
+    priv->notifyPort = IONotificationPortCreate(kIOMasterPortDefault);
+    if (!priv->notifyPort)
+        return 0;
+    np = IONotificationPortGetMachPort(priv->notifyPort);
+    if (mach_port_insert_member(mach_task_self(), np, priv->portSet) != KERN_SUCCESS)
+        return 0;
+    if (IOServiceAddMatchingNotification(priv->notifyPort, kIOTerminatedNotification,
+                                         IOServiceMatching("IOHIDEventService"),
+                                         IOHIDNotifyNoop, NULL, &priv->termIter) != KERN_SUCCESS ||
+        IOServiceAddMatchingNotification(priv->notifyPort, kIOFirstMatchNotification,
+                                         IOServiceMatching("IOHIDEventService"),
+                                         IOHIDNotifyNoop, NULL, &priv->matchIter) != KERN_SUCCESS)
+        return 0;
+    /* Arm the terminated iterator (it starts empty), then take what exists. */
+    IOHIDScanTerminated(pInfo);
+    IOHIDScanMatched(pInfo);
+    return 1;
+}
+
+static void
 IOHIDReadInput(InputInfoPtr pInfo)
 {
     IOHIDPrivPtr priv = pInfo->private;
@@ -332,6 +535,10 @@ IOHIDReadInput(InputInfoPtr pInfo)
 
     while (read(pInfo->fd, drain, sizeof(drain)) > 0)
         ;
+    /* Every wake may be a plug or unplug rather than events. Unplugs first,
+     * so a replug of the same slot is not seen as a duplicate. */
+    IOHIDScanTerminated(pInfo);
+    IOHIDScanMatched(pInfo);
     for (int i = 0; i < priv->nsvc; i++) {
         IOHIDService *s = &priv->svc[i];
         uint32_t len = IOHID_ENTRY_MAX;
@@ -399,16 +606,21 @@ static void
 IOHIDCloseServices(IOHIDPrivPtr priv)
 {
     IOHIDStopThread(priv);
-    for (int i = 0; i < priv->nsvc; i++) {
-        IOHIDService *s = &priv->svc[i];
-        if (s->queue)
-            IOConnectUnmapMemory64(s->connect, 0, mach_task_self(), (mach_vm_address_t)(uintptr_t)s->queue);
-        if (s->connect)
-            IOServiceClose(s->connect);
-        if (s->port)
-            mach_port_mod_refs(mach_task_self(), s->port, MACH_PORT_RIGHT_RECEIVE, -1);
-    }
+    for (int i = 0; i < priv->nsvc; i++)
+        IOHIDCloseService(&priv->svc[i]);
     priv->nsvc = 0;
+    if (priv->matchIter) {
+        IOObjectRelease(priv->matchIter);
+        priv->matchIter = IO_OBJECT_NULL;
+    }
+    if (priv->termIter) {
+        IOObjectRelease(priv->termIter);
+        priv->termIter = IO_OBJECT_NULL;
+    }
+    if (priv->notifyPort) {
+        IONotificationPortDestroy(priv->notifyPort);
+        priv->notifyPort = NULL;
+    }
     if (priv->ctlPort) {
         mach_port_mod_refs(mach_task_self(), priv->ctlPort, MACH_PORT_RIGHT_RECEIVE, -1);
         mach_port_deallocate(mach_task_self(), priv->ctlPort);
@@ -422,62 +634,6 @@ IOHIDCloseServices(IOHIDPrivPtr priv)
         IOServiceClose(priv->hidSystem);   /* evClose: keys go back to the console */
         priv->hidSystem = IO_OBJECT_NULL;
     }
-}
-
-static int
-IOHIDOpenServices(InputInfoPtr pInfo)
-{
-    IOHIDPrivPtr priv = pInfo->private;
-    io_iterator_t it = IO_OBJECT_NULL;
-    io_service_t s;
-
-    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_PORT_SET, &priv->portSet) != KERN_SUCCESS)
-        return 0;
-    if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &priv->ctlPort) != KERN_SUCCESS ||
-        mach_port_insert_right(mach_task_self(), priv->ctlPort, priv->ctlPort, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS ||
-        mach_port_insert_member(mach_task_self(), priv->ctlPort, priv->portSet) != KERN_SUCCESS)
-        return 0;
-    if (IOServiceGetMatchingServices(kIOMasterPortDefault, IOServiceMatching("IOHIDEventService"), &it) != KERN_SUCCESS)
-        return 0;
-    while (priv->nsvc < IOHID_MAX_SERVICES && (s = IOIteratorNext(it)) != IO_OBJECT_NULL) {
-        int page = IOHIDIntProp(s, "PrimaryUsagePage"), usage = IOHIDIntProp(s, "PrimaryUsage");
-        if (IOHIDWantService(priv->kind, page, usage)) {
-            IOHIDService *e = &priv->svc[priv->nsvc];
-            /* Fresh state: a button held across DEVICE_OFF was released
-             * by X, so a stale mask would swallow the next press. */
-            memset(e, 0, sizeof(*e));
-            mach_vm_address_t addr = 0;
-            mach_vm_size_t size = 0;
-            uint64_t options = 0;
-            kern_return_t kr = IOServiceOpen(s, mach_task_self(), kIOHIDEventServiceUserClientType, &e->connect);
-            if (!kr)
-                kr = IOConnectCallScalarMethod(e->connect, kIOHIDEventServiceUserClientOpen, &options, 1, NULL, NULL);
-            if (!kr)
-                kr = IOConnectMapMemory64(e->connect, 0, mach_task_self(), &addr, &size, kIOMapAnywhere);
-            if (!kr) {
-                e->port = IODataQueueAllocateNotificationPort();
-                kr = e->port ? IOConnectSetNotificationPort(e->connect, 0, e->port, 0) : KERN_FAILURE;
-            }
-            if (!kr)
-                kr = mach_port_insert_member(mach_task_self(), e->port, priv->portSet);
-            if (kr) {
-                xf86IDrvMsg(pInfo, X_WARNING, "IOHIDEventService (usage %d:%d): open failed 0x%x\n",
-                            page, usage, kr);
-                if (e->connect)
-                    IOServiceClose(e->connect);
-                if (e->port)
-                    mach_port_mod_refs(mach_task_self(), e->port, MACH_PORT_RIGHT_RECEIVE, -1);
-                memset(e, 0, sizeof(*e));
-            } else {
-                e->queue = (IODataQueueMemory *)(uintptr_t)addr;
-                xf86IDrvMsg(pInfo, X_INFO, "IOHIDEventService (usage %d:%d) opened\n", page, usage);
-                priv->nsvc++;
-            }
-        }
-        IOObjectRelease(s);
-    }
-    IOObjectRelease(it);
-    return priv->nsvc;
 }
 
 /* Keyboard: take keys from the text console the way WindowServer does. */
@@ -519,7 +675,21 @@ IOHIDAcquireConsole(InputInfoPtr pInfo)
 }
 
 static void IOHIDPtrCtrl(DeviceIntPtr dev, PtrCtrl *ctrl) { (void)dev; (void)ctrl; }
-static void IOHIDKbdCtrl(DeviceIntPtr dev, KeybdCtrl *ctrl) { (void)dev; (void)ctrl; }
+static void
+IOHIDKbdCtrl(DeviceIntPtr dev, KeybdCtrl *ctrl)
+{
+    InputInfoPtr pInfo = dev->public.devicePrivate;
+    IOHIDPrivPtr priv = pInfo ? pInfo->private : NULL;
+
+    if (!priv || priv->kind != IOHID_KEYBOARD)
+        return;
+    pthread_mutex_lock(&priv->svcLock);
+    priv->leds = ctrl->leds;
+    priv->ledsValid = TRUE;
+    for (int i = 0; i < priv->nsvc; i++)
+        IOHIDSetLEDs(&priv->svc[i], priv->leds);
+    pthread_mutex_unlock(&priv->svcLock);
+}
 
 static int
 IOHIDDeviceControl(DeviceIntPtr dev, int what)
@@ -555,11 +725,13 @@ IOHIDDeviceControl(DeviceIntPtr dev, int what)
     case DEVICE_ON:
         if (pInfo->fd < 0) {
             if (IOHIDOpenServices(pInfo) == 0) {
-                xf86IDrvMsg(pInfo, X_WARNING, "no %s IOHIDEventService could be opened\n",
-                            priv->kind == IOHID_KEYBOARD ? "keyboard" : "pointer");
+                xf86IDrvMsg(pInfo, X_ERROR, "IOHIDEventService notifications could not be set up\n");
                 IOHIDCloseServices(priv);
                 return BadRequest;
             }
+            if (priv->nsvc == 0)
+                xf86IDrvMsg(pInfo, X_INFO, "no %s IOHIDEventService yet; waiting for one\n",
+                            priv->kind == IOHID_KEYBOARD ? "keyboard" : "pointer");
             if (pipe(priv->pipeFd) < 0 ||
                 fcntl(priv->pipeFd[0], F_SETFL, O_NONBLOCK) < 0 ||
                 fcntl(priv->pipeFd[1], F_SETFL, O_NONBLOCK) < 0 ||
@@ -611,6 +783,7 @@ IOHIDPreInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags)
         return BadAlloc;
     }
     priv->pipeFd[0] = priv->pipeFd[1] = -1;
+    pthread_mutex_init(&priv->svcLock, NULL);
     pInfo->private = priv;
 
     type = xf86SetStrOption(pInfo->options, "Type", "pointer");
@@ -637,6 +810,7 @@ IOHIDUnInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags)
     (void)drv;
     if (priv) {
         IOHIDCloseServices(priv);
+        pthread_mutex_destroy(&priv->svcLock);
         free(priv->buf);
         free(priv);
         pInfo->private = NULL;
