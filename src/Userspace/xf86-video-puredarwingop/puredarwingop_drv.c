@@ -38,6 +38,16 @@
 typedef struct {
     PDGOPFramebuffer fb;          /* live IOGOPFramebuffer connection + mapping */
     Bool             fbOpen;
+    uint32_t         cacheMode;   /* PDGOP_MAP_* the VRAM is mapped with */
+    Bool             useShadow;   /* Option "ShadowFB" */
+    int              updateDelay; /* Option "ShadowUpdateDelay", ms */
+    Bool             stats;       /* Option "ShadowStats" */
+    CARD32           firstDamage; /* when the oldest un-copied damage arrived */
+    CARD32           lastDamage;  /* when damage last arrived */
+    Bool             pending;     /* damage waiting for the update delay */
+    CARD32           statsStart;
+    unsigned long    statUpdates, statBoxes, statBytes;
+    double           statSeconds;
     void            *shadow;      /* cached-RAM render target, blitted to VRAM */
     DamagePtr        damage;      /* tracks which parts of it need pushing out */
     ScreenBlockHandlerProcPtr BlockHandler;
@@ -67,6 +77,7 @@ PDGOPFreeRec(ScrnInfoPtr pScrn)
         PDGOPClose(&p->fb);
         p->fbOpen = FALSE;
     }
+    free(p->Options);
     free(p);
     pScrn->driverPrivate = NULL;
 }
@@ -86,11 +97,73 @@ static Bool PDGOPCloseScreen(ScreenPtr pScreen);
 static ModeStatus PDGOPValidMode(ScrnInfoPtr pScrn, DisplayModePtr mode,
                                  Bool verbose, int flags);
 
-enum { OPTION_NONE = -1 };
+typedef enum {
+    OPTION_SHADOW_FB,
+    OPTION_VRAM_CACHE_MODE,
+    OPTION_SHADOW_UPDATE_DELAY,
+    OPTION_SHADOW_STATS,
+} PDGOPOpts;
 
+/*
+ * "ShadowFB" (bool, default on): render into a cached RAM copy of the
+ *     screen and copy damaged areas to VRAM from the block handler. Off
+ *     renders straight into the VRAM mapping (every fb read is then an
+ *     uncached VRAM read).
+ * "VRAMCacheMode" (string, default "writecombine"): cache attribute of the
+ *     user VRAM mapping: "writecombine" (Normal non-cacheable, stores are
+ *     gathered), "posted" (Device-nGnRE), "inhibit" (Device-nGnRnE), or
+ *     "default" (whatever the kernel picks; Device-nGnRnE for the Pi 3's
+ *     VideoCore framebuffer, the behaviour before DAR-460).
+ * "ShadowUpdateDelay" (integer ms, default 0): hold shadow-to-VRAM copies
+ *     until damage has been quiet for half this long, or this long since
+ *     the first undrawn damage, so a burst of draws (an expose followed by
+ *     the client's redraw, a window move) is copied once. 0 copies at
+ *     every block handler, as before.
+ * "ShadowStats" (bool, default off): log copy counts and time every 10 s.
+ */
 static const OptionInfoRec PDGOPOptions[] = {
+    { OPTION_SHADOW_FB,           "ShadowFB",          OPTV_BOOLEAN, {0}, FALSE },
+    { OPTION_VRAM_CACHE_MODE,     "VRAMCacheMode",     OPTV_STRING,  {0}, FALSE },
+    { OPTION_SHADOW_UPDATE_DELAY, "ShadowUpdateDelay", OPTV_INTEGER, {0}, FALSE },
+    { OPTION_SHADOW_STATS,        "ShadowStats",       OPTV_BOOLEAN, {0}, FALSE },
     { -1, NULL, OPTV_NONE, {0}, FALSE }
 };
+
+static const char *
+PDGOPCacheModeName(uint32_t mode)
+{
+    switch (mode) {
+    case PDGOP_MAP_DEFAULT_CACHE: return "default";
+    case PDGOP_MAP_INHIBIT_CACHE: return "inhibit";
+    case PDGOP_MAP_WRITE_COMBINE: return "writecombine";
+    case PDGOP_MAP_POSTED_WRITE:  return "posted";
+    default:                      return "?";
+    }
+}
+
+/* Open the framebuffer with the configured cache mode; if the kernel will
+ * not map VRAM that way, fall back to its default mapping. */
+static kern_return_t
+PDGOPOpenConfigured(ScrnInfoPtr pScrn, PDGOPPtr p)
+{
+    kern_return_t kr = PDGOPOpenWithCacheMode(&p->fb, p->cacheMode);
+
+    if (kr != KERN_SUCCESS && p->cacheMode != PDGOP_MAP_DEFAULT_CACHE) {
+        xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                   "mapping VRAM %s failed at %s (0x%x); using the default mapping\n",
+                   PDGOPCacheModeName(p->cacheMode), PDGOPLastErrorStage(), kr);
+        p->cacheMode = PDGOP_MAP_DEFAULT_CACHE;
+        kr = PDGOPOpenWithCacheMode(&p->fb, p->cacheMode);
+    }
+    if (kr == KERN_SUCCESS) {
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                   "VRAM mapped %s (map options 0x%x) at 0x%llx, size 0x%llx\n",
+                   PDGOPCacheModeName(p->cacheMode), p->fb.mapOptions,
+                   (unsigned long long)p->fb.address,
+                   (unsigned long long)p->fb.size);
+    }
+    return kr;
+}
 
 /* Field order per DriverRec (xf86str.h): driverVersion, driverName, Identify,
  * Probe, AvailableOptions, module, refCount, driverFunc, supported_devices,
@@ -268,9 +341,49 @@ PDGOPPreInit(ScrnInfoPtr pScrn, int flags)
 
     p = PDGOPGetRec(pScrn);
 
+    /* Options first: the VRAM cache mode is needed to open the framebuffer. */
+    pScrn->monitor = pScrn->confScreen->monitor;
+    xf86CollectOptions(pScrn, NULL);
+    p->Options = malloc(sizeof(PDGOPOptions));
+    if (p->Options == NULL) {
+        return FALSE;
+    }
+    memcpy(p->Options, PDGOPOptions, sizeof(PDGOPOptions));
+    xf86ProcessOptions(pScrn->scrnIndex, pScrn->options, p->Options);
+
+    p->cacheMode = PDGOP_MAP_WRITE_COMBINE;
+    {
+        const char *s = xf86GetOptValString(p->Options, OPTION_VRAM_CACHE_MODE);
+        if (s != NULL) {
+            if (!xf86NameCmp(s, "writecombine") || !xf86NameCmp(s, "wc")) {
+                p->cacheMode = PDGOP_MAP_WRITE_COMBINE;
+            } else if (!xf86NameCmp(s, "default")) {
+                p->cacheMode = PDGOP_MAP_DEFAULT_CACHE;
+            } else if (!xf86NameCmp(s, "inhibit") || !xf86NameCmp(s, "uncached")) {
+                p->cacheMode = PDGOP_MAP_INHIBIT_CACHE;
+            } else if (!xf86NameCmp(s, "posted")) {
+                p->cacheMode = PDGOP_MAP_POSTED_WRITE;
+            } else {
+                xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
+                           "unknown VRAMCacheMode \"%s\"; using writecombine\n", s);
+            }
+        }
+    }
+    p->useShadow = xf86ReturnOptValBool(p->Options, OPTION_SHADOW_FB, TRUE);
+    p->updateDelay = 0;
+    if (xf86GetOptValInteger(p->Options, OPTION_SHADOW_UPDATE_DELAY, &p->updateDelay)) {
+        if (p->updateDelay < 0) p->updateDelay = 0;
+        if (p->updateDelay > 200) p->updateDelay = 200;
+    }
+    p->stats = xf86ReturnOptValBool(p->Options, OPTION_SHADOW_STATS, FALSE);
+    xf86DrvMsg(pScrn->scrnIndex, X_CONFIG,
+               "ShadowFB %s, ShadowUpdateDelay %d ms, VRAMCacheMode %s%s\n",
+               p->useShadow ? "on" : "off", p->updateDelay,
+               PDGOPCacheModeName(p->cacheMode), p->stats ? ", ShadowStats on" : "");
+
     /* Open the IOGOPFramebuffer user client and read its geometry now, so mode
      * setup below reflects the real GOP resolution rather than a guess. */
-    kr = PDGOPOpen(&p->fb);
+    kr = PDGOPOpenConfigured(pScrn, p);
     if (kr != KERN_SUCCESS) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
                    "PDGOPOpen failed at %s: 0x%x\n",
@@ -282,8 +395,6 @@ PDGOPPreInit(ScrnInfoPtr pScrn, int flags)
     xf86DrvMsg(pScrn->scrnIndex, X_INFO,
                "IOGOPFramebuffer: %ux%u, %u bpp, stride %u\n",
                p->fb.width, p->fb.height, p->fb.bpp, p->fb.stride);
-
-    pScrn->monitor = pScrn->confScreen->monitor;
 
     /* GOP is 32bpp BGRA/XRGB; advertise depth 24 in a 32-bit framebuffer. */
     if (!xf86SetDepthBpp(pScrn, 24, 0, p->fb.bpp,
@@ -303,8 +414,6 @@ PDGOPPreInit(ScrnInfoPtr pScrn, int flags)
     pScrn->rgbBits   = 8;
     pScrn->chipset   = PDGOP_DRIVER_NAME;
     pScrn->videoRam  = (int)(p->fb.size / 1024);
-
-    xf86CollectOptions(pScrn, NULL);
 
     /* Build a single mode matching the live GOP resolution. */
     mode = xnfcalloc(sizeof(DisplayModeRec), 1);
@@ -343,11 +452,45 @@ PDGOPPreInit(ScrnInfoPtr pScrn, int flags)
     return TRUE;
 }
 
-/* Copy the damaged rectangles from the cached-RAM shadow into the VRAM
- * aperture. Both are linear and share a stride, so each rectangle is a run of
- * per-scanline memcpy()s - sequential write-combine stores, which is the one
- * access pattern the aperture is fast at. */
+typedef uint32_t PDGOPVec __attribute__((vector_size(16), aligned(16)));
+
+/* One scanline run, shadow -> VRAM: 4-byte stores up to 16-byte alignment,
+ * then 64 bytes per iteration as four aligned 16-byte stores, then a 4-byte
+ * tail. Every store is aligned to its size, so this is also safe on a
+ * Device-memory mapping (VRAMCacheMode "default"/"inhibit"/"posted"), where
+ * an unaligned access faults; and on a write-combine mapping the aligned
+ * 16-byte stores fill whole write-buffer lines. Pixels are 32-bit, so dst,
+ * src and bytes are multiples of 4. */
 static void
+PDGOPCopyRun(CARD8 *dst, const CARD8 *src, size_t bytes)
+{
+    while (bytes >= 4 && ((uintptr_t)dst & 15)) {
+        *(volatile uint32_t *)dst = *(const uint32_t *)src;
+        dst += 4; src += 4; bytes -= 4;
+    }
+    while (bytes >= 64) {
+        PDGOPVec a, b, c, d;
+        memcpy(&a, src, 16);
+        memcpy(&b, src + 16, 16);
+        memcpy(&c, src + 32, 16);
+        memcpy(&d, src + 48, 16);
+        ((volatile PDGOPVec *)dst)[0] = a;
+        ((volatile PDGOPVec *)dst)[1] = b;
+        ((volatile PDGOPVec *)dst)[2] = c;
+        ((volatile PDGOPVec *)dst)[3] = d;
+        dst += 64; src += 64; bytes -= 64;
+    }
+    while (bytes >= 4) {
+        *(volatile uint32_t *)dst = *(const uint32_t *)src;
+        dst += 4; src += 4; bytes -= 4;
+    }
+}
+
+/* Copy the damaged rectangles from the cached-RAM shadow into the VRAM
+ * aperture. Both are linear and share the framebuffer's real stride
+ * (pScrn->displayWidth = bytesPerRow / 4, which can exceed the width), so
+ * each rectangle is a run of per-scanline copies. Returns bytes copied. */
+static size_t
 PDGOPBlitDamage(ScrnInfoPtr pScrn, RegionPtr region)
 {
     PDGOPPtr p = PDGOPGetRec(pScrn);
@@ -355,13 +498,15 @@ PDGOPBlitDamage(ScrnInfoPtr pScrn, RegionPtr region)
     BoxPtr   box;
     int      bpp = pScrn->bitsPerPixel >> 3;
     size_t   stride = (size_t)pScrn->displayWidth * (size_t)bpp;
+    size_t   copied = 0;
 
     if (region == NULL || p->shadow == NULL) {
-        return;
+        return 0;
     }
 
     nbox = RegionNumRects(region);
     box  = RegionRects(region);
+    p->statBoxes += (unsigned long)nbox;
 
     for (; nbox--; box++) {
         int y1 = box->y1 < 0 ? 0 : box->y1;
@@ -377,10 +522,12 @@ PDGOPBlitDamage(ScrnInfoPtr pScrn, RegionPtr region)
 
         for (int y = y1; y < y2; y++) {
             size_t off = (size_t)y * stride + (size_t)x1 * (size_t)bpp;
-            memcpy((CARD8 *)(uintptr_t)p->fb.address + off,
-                   (CARD8 *)p->shadow + off, width);
+            PDGOPCopyRun((CARD8 *)(uintptr_t)p->fb.address + off,
+                         (const CARD8 *)p->shadow + off, width);
         }
+        copied += width * (size_t)(y2 - y1);
     }
+    return copied;
 }
 
 /* Damage reporting only records the region; the copy happens once per dispatch
@@ -388,9 +535,20 @@ PDGOPBlitDamage(ScrnInfoPtr pScrn, RegionPtr region)
 static void
 PDGOPDamageReport(DamagePtr damage, RegionPtr region, void *closure)
 {
+    PDGOPPtr p = closure;
+    CARD32   now;
+
     (void)damage;
     (void)region;
-    (void)closure;
+    if (p == NULL || p->updateDelay <= 0) {
+        return;
+    }
+    now = GetTimeInMillis();
+    if (!p->pending) {
+        p->pending = TRUE;
+        p->firstDamage = now;
+    }
+    p->lastDamage = now;
 }
 
 static void
@@ -410,13 +568,56 @@ PDGOPBlockHandler(ScreenPtr pScreen, void *timeout)
     }
     region = DamageRegion(p->damage);
     if (RegionNotEmpty(region)) {
-        PDGOPBlitDamage(pScrn, region);
+        CARD32 now = GetTimeInMillis();
+
+        if (p->updateDelay > 0 && p->pending) {
+            /* Wait for a quiet gap of updateDelay/2, but never hold damage
+             * longer than updateDelay in total. */
+            int quiet = p->updateDelay / 2;
+            int sinceLast = (int)(now - p->lastDamage);
+            int sinceFirst = (int)(now - p->firstDamage);
+
+            if (sinceLast < quiet && sinceFirst < p->updateDelay) {
+                int wait = quiet - sinceLast;
+                if (p->updateDelay - sinceFirst < wait) {
+                    wait = p->updateDelay - sinceFirst;
+                }
+                AdjustWaitForDelay(timeout, wait);
+                return;
+            }
+        }
+        {
+            double t0 = p->stats ? (double)GetTimeInMicros() : 0.0;
+            size_t bytes = PDGOPBlitDamage(pScrn, region);
+
+            if (p->stats) {
+                p->statSeconds += ((double)GetTimeInMicros() - t0) / 1e6;
+                p->statBytes += bytes;
+                p->statUpdates++;
+            }
+        }
         /* The mapped pages are the VirtIO resource backing, but the host
-         * scanout only sees them after an explicit transfer/flush. */
+         * scanout only sees them after an explicit transfer/flush. PDGOP
+         * makes this a no-op for any other framebuffer service. */
         (void)PDGOPPresent(&p->fb, 0, 0,
                            (uint32_t)pScrn->virtualX,
                            (uint32_t)pScrn->virtualY);
         DamageEmpty(p->damage);
+        p->pending = FALSE;
+
+        if (p->stats) {
+            if (p->statsStart == 0) {
+                p->statsStart = now;
+            } else if ((int)(now - p->statsStart) >= 10000) {
+                xf86DrvMsg(pScrn->scrnIndex, X_INFO,
+                           "ShadowStats: %lu updates, %lu boxes, %lu KB copied in %.1f ms over %.1f s\n",
+                           p->statUpdates, p->statBoxes, p->statBytes / 1024,
+                           p->statSeconds * 1e3, (now - p->statsStart) / 1000.0);
+                p->statUpdates = p->statBoxes = p->statBytes = 0;
+                p->statSeconds = 0;
+                p->statsStart = now;
+            }
+        }
     }
 }
 
@@ -436,8 +637,16 @@ PDGOPCreateScreenResources(ScreenPtr pScreen)
         return FALSE;
     }
 
-    p->damage = DamageCreate(PDGOPDamageReport, NULL, DamageReportNonEmpty,
-                             TRUE, pScreen, NULL);
+    if (!p->useShadow) {
+        return TRUE;
+    }
+
+    /* Raw reports (every damaging op) feed the update-delay timestamps;
+     * the region still accumulates (miext/damage/damage.c,
+     * DamageReportRawRegion: RegionUnion then the callback). */
+    p->damage = DamageCreate(PDGOPDamageReport, NULL,
+                             p->updateDelay > 0 ? DamageReportRawRegion : DamageReportNonEmpty,
+                             TRUE, pScreen, p);
     if (p->damage == NULL) {
         xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "DamageCreate failed\n");
         return FALSE;
@@ -472,7 +681,7 @@ PDGOPScreenInit(ScreenPtr pScreen, int argc, char **argv)
      * without PreInit, so reopen here if a previous CloseScreen closed it.
      */
     if (!p->fbOpen) {
-        kern_return_t kr = PDGOPOpen(&p->fb);
+        kern_return_t kr = PDGOPOpenConfigured(pScrn, p);
         if (kr != KERN_SUCCESS) {
             xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
                        "ScreenInit: PDGOPOpen failed at %s: 0x%x\n",
@@ -488,14 +697,21 @@ PDGOPScreenInit(ScreenPtr pScreen, int argc, char **argv)
     /* Clear VRAM to black before X takes over. */
     memset((void *)(uintptr_t)p->fb.address, 0, (size_t)p->fb.size);
 
-    p->shadow = calloc(1, (size_t)p->fb.size);
-    if (p->shadow == NULL) {
-        xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
-                   "failed to allocate %llu-byte shadow framebuffer\n",
-                   (unsigned long long)p->fb.size);
-        return FALSE;
+    if (p->useShadow) {
+        p->shadow = calloc(1, (size_t)p->fb.size);
+        if (p->shadow == NULL) {
+            xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+                       "failed to allocate %llu-byte shadow framebuffer\n",
+                       (unsigned long long)p->fb.size);
+            return FALSE;
+        }
+        fbstart = p->shadow;
+    } else {
+        /* No shadow: fb renders straight into the VRAM mapping. */
+        fbstart = (void *)(uintptr_t)p->fb.address;
     }
-    fbstart = p->shadow;
+    xf86DrvMsg(pScrn->scrnIndex, X_INFO, "rendering into %s\n",
+               p->useShadow ? "a shadow framebuffer in RAM" : "VRAM directly");
 
     miClearVisualTypes();
     if (!miSetVisualTypes(pScrn->depth, miGetDefaultVisualMask(pScrn->depth),
@@ -555,8 +771,10 @@ PDGOPScreenInit(ScreenPtr pScreen, int argc, char **argv)
     p->CreateScreenResources = pScreen->CreateScreenResources;
     pScreen->CreateScreenResources = PDGOPCreateScreenResources;
 
-    p->BlockHandler = pScreen->BlockHandler;
-    pScreen->BlockHandler = PDGOPBlockHandler;
+    if (p->useShadow) {
+        p->BlockHandler = pScreen->BlockHandler;
+        pScreen->BlockHandler = PDGOPBlockHandler;
+    }
 
     /* Wrap CloseScreen so we tear down the PDGOP mapping. */
     p->CloseScreen = pScreen->CloseScreen;
