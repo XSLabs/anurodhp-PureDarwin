@@ -341,15 +341,26 @@ PDGOPPreInit(ScrnInfoPtr pScrn, int flags)
 
     p = PDGOPGetRec(pScrn);
 
-    /* Options first: the VRAM cache mode is needed to open the framebuffer. */
+    /* Options first: the VRAM cache mode is needed to open the framebuffer.
+     * xf86CollectOptions() cannot run yet: it dereferences pScrn->display
+     * (xserver hw/xfree86/common/xf86Option.c:109), which xf86SetDepthBpp()
+     * sets only after the framebuffer's bpp is known. So read the Device
+     * section's options directly here; xf86CollectOptions() runs at its
+     * usual place below and the list is processed again there (that marks
+     * the options used and adds any Screen/Display-level ones). */
     pScrn->monitor = pScrn->confScreen->monitor;
-    xf86CollectOptions(pScrn, NULL);
     p->Options = malloc(sizeof(PDGOPOptions));
     if (p->Options == NULL) {
         return FALSE;
     }
     memcpy(p->Options, PDGOPOptions, sizeof(PDGOPOptions));
-    xf86ProcessOptions(pScrn->scrnIndex, pScrn->options, p->Options);
+    {
+        GDevPtr dev = xf86GetDevFromEntity(pScrn->entityList[0],
+                                           pScrn->entityInstanceList[0]);
+        if (dev != NULL && dev->options != NULL) {
+            xf86ProcessOptions(pScrn->scrnIndex, dev->options, p->Options);
+        }
+    }
 
     p->cacheMode = PDGOP_MAP_WRITE_COMBINE;
     {
@@ -414,6 +425,9 @@ PDGOPPreInit(ScrnInfoPtr pScrn, int flags)
     pScrn->rgbBits   = 8;
     pScrn->chipset   = PDGOP_DRIVER_NAME;
     pScrn->videoRam  = (int)(p->fb.size / 1024);
+
+    xf86CollectOptions(pScrn, NULL);
+    xf86ProcessOptions(pScrn->scrnIndex, pScrn->options, p->Options);
 
     /* Build a single mode matching the live GOP resolution. */
     mode = xnfcalloc(sizeof(DisplayModeRec), 1);
