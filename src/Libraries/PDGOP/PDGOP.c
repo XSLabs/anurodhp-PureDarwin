@@ -41,6 +41,12 @@ typedef struct IOPixelInformation {
 kern_return_t
 PDGOPOpen(PDGOPFramebuffer *fb)
 {
+    return PDGOPOpenWithCacheMode(fb, PDGOP_MAP_DEFAULT_CACHE);
+}
+
+kern_return_t
+PDGOPOpenWithCacheMode(PDGOPFramebuffer *fb, uint32_t cacheMode)
+{
     kern_return_t kr;
 #ifdef _PD_IOKITLIB_H
     char *matching;
@@ -91,6 +97,13 @@ PDGOPOpen(PDGOPFramebuffer *fb)
             char serviceName[128] = {0};
             if (IORegistryEntryGetName(fb->service, serviceName) == KERN_SUCCESS)
                 fprintf(stderr, "PDGOP: selected framebuffer service %s\n", serviceName);
+            /* Only the VirtIO GPU needs an explicit flush (kPDGPU_Present).
+             * On an IOFramebuffer, user client selector 11 is
+             * extSetGammaTable, which wants 5 scalars, so the call is
+             * rejected before it runs and would only cost a Mach trap per
+             * screen update (xnu IOGraphicsFamily IOFramebufferUserClient.cpp
+             * methodTemplate[11]; IOUserClient.cpp checkScalarInputCount). */
+            fb->needsPresent = (i == 0);
             break;
         }
         kr = KERN_FAILURE;
@@ -128,8 +141,9 @@ PDGOPOpen(PDGOPFramebuffer *fb)
     }
 
     PDGOP_SET_STAGE("MapVRAM");
+    fb->mapOptions = kIOMapAnywhere | (cacheMode & PDGOP_MAP_CACHE_MASK);
     kr = IOConnectMapMemory64(fb->connect, kIOFBVRAMMemory, mach_task_self(),
-        &fb->address, &fb->size, kIOMapAnywhere);
+        &fb->address, &fb->size, fb->mapOptions);
     if (kr != KERN_SUCCESS) {
         goto fail;
     }
@@ -182,6 +196,8 @@ PDGOPPresent(PDGOPFramebuffer *fb, uint32_t x, uint32_t y,
 
     if (fb == NULL || fb->connect == IO_OBJECT_NULL)
         return KERN_INVALID_ARGUMENT;
+    if (!fb->needsPresent)
+        return KERN_SUCCESS;
     rect.x = x;
     rect.y = y;
     rect.width = width;
