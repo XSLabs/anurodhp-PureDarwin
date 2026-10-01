@@ -587,11 +587,11 @@ PDGOPBlockHandler(ScreenPtr pScreen, void *timeout)
             }
         }
         {
-            double t0 = p->stats ? (double)GetTimeInMicros() : 0.0;
+            CARD64 t0 = p->stats ? GetTimeInMicros() : 0;
             size_t bytes = PDGOPBlitDamage(pScrn, region);
 
             if (p->stats) {
-                p->statSeconds += ((double)GetTimeInMicros() - t0) / 1e6;
+                p->statSeconds += (double)(GetTimeInMicros() - t0) / 1e6;
                 p->statBytes += bytes;
                 p->statUpdates++;
             }
