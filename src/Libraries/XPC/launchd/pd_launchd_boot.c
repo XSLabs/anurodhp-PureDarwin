@@ -1,5 +1,7 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <spawn.h>
 #include <dirent.h>
@@ -352,6 +354,42 @@ pd_launchd_boot_apply_sysctls(const char *file)
 			file, applied, failed);
 }
 
+/*
+ * Open files per process: the soft RLIMIT_NOFILE every job inherits from
+ * launchd, which xnu starts at NOFILE, 256 (bsd/kern/bsd_init.c, limit0). macOS
+ * raises it with `launchctl limit maxfiles`, which that bootstrapper runs and
+ * this port does not, so it is raised here, after /etc/sysctl.conf set
+ * kern.maxfilesperproc. The soft limit becomes kern.maxfilesperproc, the most
+ * the kernel lets any process open whatever its rlimit (kern_resource.c,
+ * dosetrlimit), and not RLIM_INFINITY: with that, sysconf(_SC_OPEN_MAX) is
+ * LONG_MAX, and code that closes every descriptor up to it before exec
+ * (gnustep-base's NSTask, OpenSSH's closefrom) would never finish.
+ */
+static void
+pd_launchd_boot_raise_maxfiles(void)
+{
+	int perproc = 0;
+	size_t len = sizeof(perproc);
+	struct rlimit rl;
+
+	if (sysctlbyname("kern.maxfilesperproc", &perproc, &len, NULL, 0) != 0 || perproc <= 0 ||
+	    getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+		launchd_syslog(LOG_ERR | LOG_CONSOLE, "pd_launchd_boot: cannot read the open-file limits: %s",
+				strerror(errno));
+		return;
+	}
+	rl.rlim_cur = (rlim_t)perproc;
+	if (rl.rlim_max < rl.rlim_cur) {
+		rl.rlim_max = rl.rlim_cur;
+	}
+	if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+		launchd_syslog(LOG_ERR | LOG_CONSOLE, "pd_launchd_boot: setrlimit(RLIMIT_NOFILE, %d) failed: %s",
+				perproc, strerror(errno));
+		return;
+	}
+	launchd_syslog(LOG_NOTICE | LOG_CONSOLE, "pd_launchd_boot: open files per process: %d", perproc);
+}
+
 void
 pd_launchd_boot(void)
 {
@@ -362,4 +400,5 @@ pd_launchd_boot(void)
 	pd_launchd_boot_mkdir_p("/dev", 0755);
 	pd_launchd_boot_try_mount("devfs", "/dev", 0, NULL);
 	pd_launchd_boot_apply_sysctls("/etc/sysctl.conf");
+	pd_launchd_boot_raise_maxfiles();
 }
